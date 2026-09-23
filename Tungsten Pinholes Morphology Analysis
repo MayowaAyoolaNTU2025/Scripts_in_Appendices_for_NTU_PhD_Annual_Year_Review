@@ -1,0 +1,562 @@
+% Tungsten Pinholes Morphology Analysis
+
+clc;
+clear;
+close all;
+
+
+fprintf(' TUNGSTEN APERTURE ANALYSIS (PER-PARAMETER RANKING) — STARTING\n');
+
+
+dataFolder  = 'C:\Users\padra\Desktop\NewImageJ Analysis\Results2';
+
+% Hole diameters (mm) — string labels used in file names AND plots
+diamLabels  = {'0.05','0.10','0.15','0.20','0.25', ...
+                '0.30','0.35','0.40','0.45','0.50'};
+
+% Threshold values used in file names
+thresholds  = [80, 100, 120, 140, 160];
+
+nDiam   = numel(diamLabels);   % 10 hole diameters
+nThresh = numel(thresholds);   % 5 threshold repeats per diameter
+
+fprintf('Configuration loaded.\n');
+fprintf('  Diameters   : %s\n', strjoin(diamLabels,' | '));
+fprintf('  Thresholds  : %s\n', num2str(thresholds));
+fprintf('  Data folder : %s\n\n', dataFolder);
+
+
+rawData = cell(nDiam, nThresh);
+
+for d = 1:nDiam
+    for t = 1:nThresh
+        fname = sprintf('%smm%dThresholding.csv', diamLabels{d}, thresholds(t));
+        fpath = fullfile(dataFolder, fname);
+
+        if ~isfile(fpath)
+            warning('File not found: %s — filling with NaN.', fpath);
+            rawData{d,t} = makeNaNStruct();
+            continue
+        end
+
+        try
+            T = readtable(fpath, 'VariableNamingRule', 'preserve');
+
+            S.Area     = extractCol(T, {'Area'});
+            S.Perim    = extractCol(T, {'Perim.','Perim','Perimeter'});
+            S.Major    = extractCol(T, {'Major'});
+            S.Minor    = extractCol(T, {'Minor'});
+            S.Circ     = extractCol(T, {'Circ.','Circ','Circularity'});
+            S.Feret    = extractCol(T, {'Feret'});
+            S.MinFeret = extractCol(T, {'MinFeret','Min Feret','Minferet'});
+            S.AR       = extractCol(T, {'AR','AspectRatio','Aspect Ratio'});
+            S.Round    = extractCol(T, {'Round','Roundness'});
+            S.Solidity = extractCol(T, {'Solidity'});
+
+            rawData{d,t} = S;
+            fprintf('  Read : %s  (%d row(s))\n', fname, height(T));
+
+        catch ME
+            warning('Error reading %s: %s', fname, ME.message);
+            rawData{d,t} = makeNaNStruct();
+        end
+    end
+end
+
+fprintf('\nAll files processed.\n\n');
+
+
+fprintf(' SECTION 3 : Computing per-hole statistics \n');
+
+paramNames = {'Area','Perim','Major','Minor','Circ','Feret','MinFeret','AR','Round','Solidity'};
+nParam     = numel(paramNames);
+
+stats = struct();
+
+for d = 1:nDiam
+    vals = struct();
+    for p = 1:nParam
+        vals.(paramNames{p}) = nan(1, nThresh);
+    end
+
+    for t = 1:nThresh
+        S = rawData{d,t};
+        for p = 1:nParam
+            v = S.(paramNames{p});
+            if ~isempty(v) && ~all(isnan(v))
+                vals.(paramNames{p})(t) = mean(v, 'omitnan');
+            end
+        end
+    end
+
+    for p = 1:nParam
+        stats(d).(['mean' paramNames{p}]) = mean(vals.(paramNames{p}), 'omitnan');
+        stats(d).(['std'  paramNames{p}]) = std( vals.(paramNames{p}), 0, 'omitnan');
+        stats(d).(['raw'  paramNames{p}]) = vals.(paramNames{p});
+    end
+
+    % Derived parameter: Diameter Difference = Feret - MinFeret
+    stats(d).meanDiamDiff = stats(d).meanFeret - stats(d).meanMinFeret;
+    stats(d).stdDiamDiff  = sqrt(stats(d).stdFeret^2 + stats(d).stdMinFeret^2);
+    stats(d).rawDiamDiff  = vals.Feret - vals.MinFeret;
+
+    fprintf('  Hole %s mm — mean Circularity = %.4f ± %.4f\n', ...
+        diamLabels{d}, stats(d).meanCirc, stats(d).stdCirc);
+end
+
+fprintf('\nStatistics complete.\n\n');
+
+
+mCirc  = [stats.meanCirc]';      sCirc  = [stats.stdCirc]';
+mSol   = [stats.meanSolidity]';  sSol   = [stats.stdSolidity]';
+mRound = [stats.meanRound]';     sRound = [stats.stdRound]';
+mAR    = [stats.meanAR]';        sAR    = [stats.stdAR]';
+mDiff  = [stats.meanDiamDiff]';  sDiff  = [stats.stdDiamDiff]';
+
+FocusTable = table( ...
+    diamLabels', ...
+    mCirc,  sCirc, ...
+    mSol,   sSol, ...
+    mRound, sRound, ...
+    mAR,    sAR, ...
+    mDiff,  sDiff, ...
+    'VariableNames', { ...
+        'Hole_mm', ...
+        'Mean_Circularity',  'Std_Circularity', ...
+        'Mean_Solidity',     'Std_Solidity', ...
+        'Mean_Roundness',    'Std_Roundness', ...
+        'Mean_AspectRatio',  'Std_AspectRatio', ...
+        'Mean_DiamDiff',     'Std_DiamDiff'});
+
+csvFocus = fullfile(dataFolder, 'FiveParameter_Summary.csv');
+writetable(FocusTable, csvFocus);
+fprintf('  Five-parameter summary table written to: %s\n\n', csvFocus);
+disp(FocusTable);
+
+
+nRows    = nDiam * nThresh;
+tHoleMM  = cell(nRows,1);
+tThresh  = zeros(nRows,1);
+tCirc=tThresh; tSolid=tThresh; tRound=tThresh; tAR=tThresh; tDiff=tThresh;
+
+row = 0;
+for d = 1:nDiam
+    for t = 1:nThresh
+        row = row + 1;
+        tHoleMM{row} = diamLabels{d};
+        tThresh(row) = thresholds(t);
+        S = rawData{d,t};
+        tCirc(row)  = mean(S.Circ,     'omitnan');
+        tSolid(row) = mean(S.Solidity, 'omitnan');
+        tRound(row) = mean(S.Round,    'omitnan');
+        tAR(row)    = mean(S.AR,       'omitnan');
+        f           = mean(S.Feret,    'omitnan');
+        mf          = mean(S.MinFeret, 'omitnan');
+        tDiff(row)  = f - mf;
+    end
+end
+
+RawFocusTable = table(tHoleMM, tThresh, tCirc, tSolid, tRound, tAR, tDiff, ...
+    'VariableNames', {'Hole_mm','Threshold','Circularity','Solidity', ...
+                       'Roundness','AspectRatio','DiamDiff'});
+
+csvRaw = fullfile(dataFolder, 'FiveParameter_RawPerThreshold.csv');
+writetable(RawFocusTable, csvRaw);
+fprintf('  Raw per-threshold table written to: %s\n\n', csvRaw);
+
+
+
+fig1 = figure('Name','Fig 1 — Five-Parameter Summary Table', ...
+              'NumberTitle','off','Position',[50 50 1400 360]);
+uitable('Parent',fig1, ...
+        'Data',      table2cell(FocusTable), ...
+        'ColumnName',FocusTable.Properties.VariableNames, ...
+        'RowName',   [], ...
+        'Units',     'Normalized', ...
+        'Position',  [0 0 1 1], ...
+        'FontSize',  10);
+
+
+
+fig2 = figure('Name','Fig 2 — Raw Per-Threshold Data (5 Parameters)', ...
+              'NumberTitle','off','Position',[50 440 1400 480]);
+uitable('Parent',fig2, ...
+        'Data',      table2cell(RawFocusTable), ...
+        'ColumnName',RawFocusTable.Properties.VariableNames, ...
+        'RowName',   [], ...
+        'Units',     'Normalized', ...
+        'Position',  [0 0 1 1], ...
+        'FontSize',  10);
+
+
+xVec   = 1:nDiam;
+xLbl   = diamLabels;
+xAngle = 45;
+
+function setupXAxis(n, labels, ang)
+    xticks(1:n);
+    xticklabels(labels);
+    xtickangle(ang);
+end
+
+
+
+
+barParams = { ...
+    mCirc,  sCirc,  'Circularity',                          'Circularity',              'Fig 3'; ...
+    mSol,   sSol,   'Solidity',                              'Solidity',                 'Fig 4'; ...
+    mRound, sRound, 'Roundness',                             'Roundness',                'Fig 5'; ...
+    mAR,    sAR,    'Aspect Ratio',                          'Aspect Ratio',             'Fig 6'; ...
+    mDiff,  sDiff,  'Diameter Difference (Feret − MinFeret)','Diameter Difference (mm)', 'Fig 7'};
+
+for k = 1:size(barParams,1)
+    meanV = barParams{k,1};
+    stdV  = barParams{k,2};
+    ttl   = barParams{k,3};
+    ylbl  = barParams{k,4};
+    fname = barParams{k,5};
+
+    figure('Name', [fname ' — ' ttl], 'NumberTitle','off');
+    bar(xVec, meanV, 0.6, 'FaceColor',[0.27 0.51 0.71]);
+    hold on;
+    errorbar(xVec, meanV, stdV, 'k.', 'LineWidth', 1.4, 'CapSize', 8);
+    setupXAxis(nDiam, xLbl, xAngle);
+    xlabel('Aperture Diameter (mm)');
+    ylabel(ylbl);
+    title(['Tungsten Apertures — ' ttl ' (Mean ± 1 SD)']);
+    legend('Mean','±1 SD','Location','best');
+    grid on; box on;
+end
+
+
+
+
+CV_Circ  = 100 * sCirc  ./ mCirc;
+CV_Sol   = 100 * sSol   ./ mSol;
+CV_Round = 100 * sRound ./ mRound;
+CV_AR    = 100 * sAR    ./ mAR;
+% Diameter Difference is excluded from CV because its mean can be very
+% close to zero, which makes SD/Mean numerically unstable/misleading.
+CV_Diff  = 100 * sDiff  ./ mDiff;   
+
+fprintf('  CV computed for Circularity, Solidity, Roundness, Aspect Ratio, Diameter Difference.\n');
+fprintf('  (Note: Diameter-Difference CV can be unstable when its mean is near zero.)\n\n');
+
+
+CV_mat    = [CV_Circ, CV_Sol, CV_Round, CV_AR, CV_Diff];
+CV_labels = {'Circularity','Solidity','Roundness','Aspect Ratio','Diam. Difference'};
+
+figure('Name','Fig 8 — Coefficient of Variation (All Parameters)','NumberTitle','off');
+bar(xVec, CV_mat, 'grouped');
+setupXAxis(nDiam, xLbl, xAngle);
+xlabel('Aperture Diameter (mm)');
+ylabel('CV (%)');
+title('Coefficient of Variation Across Thresholds (Five Focus Parameters)');
+legend(CV_labels,'Location','best','NumColumns',3);
+grid on; box on;
+
+
+
+CV_Table = table(diamLabels', CV_Circ, CV_Sol, CV_Round, CV_AR, CV_Diff, ...
+    'VariableNames', {'Hole_mm','CV_Circularity_pct','CV_Solidity_pct', ...
+                       'CV_Roundness_pct','CV_AspectRatio_pct','CV_DiamDiff_pct'});
+
+csvCV = fullfile(dataFolder, 'CoefficientOfVariation_Table.csv');
+writetable(CV_Table, csvCV);
+fprintf('  CV table written to: %s\n\n', csvCV);
+disp(CV_Table);
+
+fig_cv = figure('Name','Fig 9 — Coefficient of Variation Table','NumberTitle','off', ...
+                 'Position',[50 50 1200 350]);
+uitable('Parent',fig_cv, ...
+        'Data',      table2cell(CV_Table), ...
+        'ColumnName',CV_Table.Properties.VariableNames, ...
+        'RowName',   [], ...
+        'Units',     'Normalized', ...
+        'Position',  [0 0 1 1], ...
+        'FontSize',  10);
+
+
+
+
+Rank_Circ_Mean = table(diamLabels', mCirc, sCirc, ...
+    'VariableNames', {'Hole_mm','Mean_Circularity','Std_Circularity'});
+Rank_Circ_Mean = sortrows(Rank_Circ_Mean, 'Mean_Circularity', 'descend');
+
+fprintf('  Highest mean Circularity : %s mm (%.4f)\n\n', ...
+    Rank_Circ_Mean.Hole_mm{1}, Rank_Circ_Mean.Mean_Circularity(1));
+disp(Rank_Circ_Mean);
+
+figure('Name','Fig 10 — Circularity Ranked by Mean','NumberTitle','off');
+bar(Rank_Circ_Mean.Mean_Circularity, 0.6, 'FaceColor',[0.27 0.51 0.71]);
+hold on;
+errorbar(1:nDiam, Rank_Circ_Mean.Mean_Circularity, Rank_Circ_Mean.Std_Circularity, ...
+         'k.', 'LineWidth',1.4, 'CapSize',8);
+xticklabels(Rank_Circ_Mean.Hole_mm);
+xtickangle(xAngle);
+xlabel('Aperture Diameter (mm)  [ranked best → worst]');
+ylabel('Mean Circularity');
+title('Apertures Ranked by Mean Circularity');
+grid on; box on;
+
+
+
+
+fprintf(' SECTION 14 : Circularity — rank by Coefficient of Variation \n');
+
+Rank_Circ_CV = table(diamLabels', CV_Circ, mCirc, ...
+    'VariableNames', {'Hole_mm','CV_Circularity_pct','Mean_Circularity'});
+Rank_Circ_CV = sortrows(Rank_Circ_CV, 'CV_Circularity_pct', 'ascend');
+
+fprintf('  Most consistent Circularity (lowest CV) : %s mm (%.2f%%)\n\n', ...
+    Rank_Circ_CV.Hole_mm{1}, Rank_Circ_CV.CV_Circularity_pct(1));
+disp(Rank_Circ_CV);
+
+figure('Name','Fig 11 — Circularity Ranked by CV','NumberTitle','off');
+bar(Rank_Circ_CV.CV_Circularity_pct, 0.6, 'FaceColor',[0.85 0.33 0.10]);
+xticklabels(Rank_Circ_CV.Hole_mm);
+xtickangle(xAngle);
+xlabel('Aperture Diameter (mm)  [ranked most → least consistent]');
+ylabel('CV of Circularity (%)');
+title('Apertures Ranked by Coefficient of Variation — Circularity');
+grid on; box on;
+
+
+
+
+fprintf(' SECTION 15 : Solidity — rank by mean \n');
+
+Rank_Sol_Mean = table(diamLabels', mSol, sSol, ...
+    'VariableNames', {'Hole_mm','Mean_Solidity','Std_Solidity'});
+Rank_Sol_Mean = sortrows(Rank_Sol_Mean, 'Mean_Solidity', 'descend');
+
+fprintf('  Highest mean Solidity : %s mm (%.4f)\n\n', ...
+    Rank_Sol_Mean.Hole_mm{1}, Rank_Sol_Mean.Mean_Solidity(1));
+disp(Rank_Sol_Mean);
+
+figure('Name','Fig 12 — Solidity Ranked by Mean','NumberTitle','off');
+bar(Rank_Sol_Mean.Mean_Solidity, 0.6, 'FaceColor',[0.27 0.51 0.71]);
+hold on;
+errorbar(1:nDiam, Rank_Sol_Mean.Mean_Solidity, Rank_Sol_Mean.Std_Solidity, ...
+         'k.', 'LineWidth',1.4, 'CapSize',8);
+xticklabels(Rank_Sol_Mean.Hole_mm);
+xtickangle(xAngle);
+xlabel('Aperture Diameter (mm)  [ranked best → worst]');
+ylabel('Mean Solidity');
+title('Apertures Ranked by Mean Solidity');
+grid on; box on;
+
+
+Rank_Sol_CV = table(diamLabels', CV_Sol, mSol, ...
+    'VariableNames', {'Hole_mm','CV_Solidity_pct','Mean_Solidity'});
+Rank_Sol_CV = sortrows(Rank_Sol_CV, 'CV_Solidity_pct', 'ascend');
+
+fprintf('  Most consistent Solidity (lowest CV) : %s mm (%.2f%%)\n\n', ...
+    Rank_Sol_CV.Hole_mm{1}, Rank_Sol_CV.CV_Solidity_pct(1));
+disp(Rank_Sol_CV);
+
+figure('Name','Fig 13 — Solidity Ranked by CV','NumberTitle','off');
+bar(Rank_Sol_CV.CV_Solidity_pct, 0.6, 'FaceColor',[0.85 0.33 0.10]);
+xticklabels(Rank_Sol_CV.Hole_mm);
+xtickangle(xAngle);
+xlabel('Aperture Diameter (mm)  [ranked most → least consistent]');
+ylabel('CV of Solidity (%)');
+title('Apertures Ranked by Coefficient of Variation — Solidity');
+grid on; box on;
+
+
+
+
+Rank_Round_Mean = table(diamLabels', mRound, sRound, ...
+    'VariableNames', {'Hole_mm','Mean_Roundness','Std_Roundness'});
+Rank_Round_Mean = sortrows(Rank_Round_Mean, 'Mean_Roundness', 'descend');
+
+fprintf('  Highest mean Roundness : %s mm (%.4f)\n\n', ...
+    Rank_Round_Mean.Hole_mm{1}, Rank_Round_Mean.Mean_Roundness(1));
+disp(Rank_Round_Mean);
+
+figure('Name','Fig 14 — Roundness Ranked by Mean','NumberTitle','off');
+bar(Rank_Round_Mean.Mean_Roundness, 0.6, 'FaceColor',[0.27 0.51 0.71]);
+hold on;
+errorbar(1:nDiam, Rank_Round_Mean.Mean_Roundness, Rank_Round_Mean.Std_Roundness, ...
+         'k.', 'LineWidth',1.4, 'CapSize',8);
+xticklabels(Rank_Round_Mean.Hole_mm);
+xtickangle(xAngle);
+xlabel('Aperture Diameter (mm)  [ranked best → worst]');
+ylabel('Mean Roundness');
+title('Apertures Ranked by Mean Roundness');
+grid on; box on;
+
+
+
+Rank_Round_CV = table(diamLabels', CV_Round, mRound, ...
+    'VariableNames', {'Hole_mm','CV_Roundness_pct','Mean_Roundness'});
+Rank_Round_CV = sortrows(Rank_Round_CV, 'CV_Roundness_pct', 'ascend');
+
+fprintf('  Most consistent Roundness (lowest CV) : %s mm (%.2f%%)\n\n', ...
+    Rank_Round_CV.Hole_mm{1}, Rank_Round_CV.CV_Roundness_pct(1));
+disp(Rank_Round_CV);
+
+figure('Name','Fig 15 — Roundness Ranked by CV','NumberTitle','off');
+bar(Rank_Round_CV.CV_Roundness_pct, 0.6, 'FaceColor',[0.85 0.33 0.10]);
+xticklabels(Rank_Round_CV.Hole_mm);
+xtickangle(xAngle);
+xlabel('Aperture Diameter (mm)  [ranked most → least consistent]');
+ylabel('CV of Roundness (%)');
+title('Apertures Ranked by Coefficient of Variation — Roundness');
+grid on; box on;
+
+
+AR_devFromIdeal = abs(mAR - 1);
+Rank_AR_Mean = table(diamLabels', mAR, sAR, AR_devFromIdeal, ...
+    'VariableNames', {'Hole_mm','Mean_AspectRatio','Std_AspectRatio','AbsDeviationFrom1'});
+Rank_AR_Mean = sortrows(Rank_AR_Mean, 'AbsDeviationFrom1', 'ascend');
+
+fprintf('  Mean Aspect Ratio closest to 1 : %s mm (AR = %.4f)\n\n', ...
+    Rank_AR_Mean.Hole_mm{1}, Rank_AR_Mean.Mean_AspectRatio(1));
+disp(Rank_AR_Mean);
+
+figure('Name','Fig 16 — Aspect Ratio Ranked by Mean','NumberTitle','off');
+bar(Rank_AR_Mean.Mean_AspectRatio, 0.6, 'FaceColor',[0.27 0.51 0.71]);
+hold on;
+errorbar(1:nDiam, Rank_AR_Mean.Mean_AspectRatio, Rank_AR_Mean.Std_AspectRatio, ...
+         'k.', 'LineWidth',1.4, 'CapSize',8);
+yline(1, 'k--', 'Ideal (AR = 1)', 'LineWidth',1.5);
+xticklabels(Rank_AR_Mean.Hole_mm);
+xtickangle(xAngle);
+xlabel('Aperture Diameter (mm)  [ranked best → worst, closest to 1 first]');
+ylabel('Mean Aspect Ratio');
+title('Apertures Ranked by Mean Aspect Ratio (Closeness to 1)');
+grid on; box on;
+
+
+Rank_AR_CV = table(diamLabels', CV_AR, mAR, ...
+    'VariableNames', {'Hole_mm','CV_AspectRatio_pct','Mean_AspectRatio'});
+Rank_AR_CV = sortrows(Rank_AR_CV, 'CV_AspectRatio_pct', 'ascend');
+
+fprintf('  Most consistent Aspect Ratio (lowest CV) : %s mm (%.2f%%)\n\n', ...
+    Rank_AR_CV.Hole_mm{1}, Rank_AR_CV.CV_AspectRatio_pct(1));
+disp(Rank_AR_CV);
+
+figure('Name','Fig 17 — Aspect Ratio Ranked by CV','NumberTitle','off');
+bar(Rank_AR_CV.CV_AspectRatio_pct, 0.6, 'FaceColor',[0.85 0.33 0.10]);
+xticklabels(Rank_AR_CV.Hole_mm);
+xtickangle(xAngle);
+xlabel('Aperture Diameter (mm)  [ranked most → least consistent]');
+ylabel('CV of Aspect Ratio (%)');
+title('Apertures Ranked by Coefficient of Variation — Aspect Ratio');
+grid on; box on;
+
+
+
+
+
+Diff_devFromIdeal = abs(mDiff - 0);
+Rank_Diff_Mean = table(diamLabels', mDiff, sDiff, Diff_devFromIdeal, ...
+    'VariableNames', {'Hole_mm','Mean_DiamDiff','Std_DiamDiff','AbsDeviationFrom0'});
+Rank_Diff_Mean = sortrows(Rank_Diff_Mean, 'AbsDeviationFrom0', 'ascend');
+
+fprintf('  Mean Diameter Difference closest to 0 : %s mm (DiamDiff = %.4f mm)\n\n', ...
+    Rank_Diff_Mean.Hole_mm{1}, Rank_Diff_Mean.Mean_DiamDiff(1));
+disp(Rank_Diff_Mean);
+
+figure('Name','Fig 18 — Diameter Difference Ranked by Mean','NumberTitle','off');
+bar(Rank_Diff_Mean.Mean_DiamDiff, 0.6, 'FaceColor',[0.27 0.51 0.71]);
+hold on;
+errorbar(1:nDiam, Rank_Diff_Mean.Mean_DiamDiff, Rank_Diff_Mean.Std_DiamDiff, ...
+         'k.', 'LineWidth',1.4, 'CapSize',8);
+yline(0, 'k--', 'Ideal (DiamDiff = 0)', 'LineWidth',1.5);
+xticklabels(Rank_Diff_Mean.Hole_mm);
+xtickangle(xAngle);
+xlabel('Aperture Diameter (mm)  [ranked best → worst, closest to 0 first]');
+ylabel('Mean Diameter Difference (mm)');
+title('Apertures Ranked by Mean Diameter Difference (Closeness to 0)');
+grid on; box on;
+
+
+Rank_Diff_CV = table(diamLabels', CV_Diff, mDiff, ...
+    'VariableNames', {'Hole_mm','CV_DiamDiff_pct','Mean_DiamDiff'});
+Rank_Diff_CV = sortrows(Rank_Diff_CV, 'CV_DiamDiff_pct', 'ascend');
+
+fprintf('  Most consistent Diameter Difference (lowest CV) : %s mm (%.2f%%)\n', ...
+    Rank_Diff_CV.Hole_mm{1}, Rank_Diff_CV.CV_DiamDiff_pct(1));
+fprintf('  (Caution: CV of Diameter Difference can be unstable near zero mean.)\n\n');
+disp(Rank_Diff_CV);
+
+figure('Name','Fig 19 — Diameter Difference Ranked by CV','NumberTitle','off');
+bar(Rank_Diff_CV.CV_DiamDiff_pct, 0.6, 'FaceColor',[0.85 0.33 0.10]);
+xticklabels(Rank_Diff_CV.Hole_mm);
+xtickangle(xAngle);
+xlabel('Aperture Diameter (mm)  [ranked most → least consistent]');
+ylabel('CV of Diameter Difference (%)');
+title('Apertures Ranked by Coefficient of Variation — Diameter Difference');
+grid on; box on;
+
+
+
+
+writetable(Rank_Circ_Mean,  fullfile(dataFolder, 'Rank_Circularity_ByMean.csv'));
+writetable(Rank_Circ_CV,    fullfile(dataFolder, 'Rank_Circularity_ByCV.csv'));
+writetable(Rank_Sol_Mean,   fullfile(dataFolder, 'Rank_Solidity_ByMean.csv'));
+writetable(Rank_Sol_CV,     fullfile(dataFolder, 'Rank_Solidity_ByCV.csv'));
+writetable(Rank_Round_Mean, fullfile(dataFolder, 'Rank_Roundness_ByMean.csv'));
+writetable(Rank_Round_CV,   fullfile(dataFolder, 'Rank_Roundness_ByCV.csv'));
+writetable(Rank_AR_Mean,    fullfile(dataFolder, 'Rank_AspectRatio_ByMean.csv'));
+writetable(Rank_AR_CV,      fullfile(dataFolder, 'Rank_AspectRatio_ByCV.csv'));
+writetable(Rank_Diff_Mean,  fullfile(dataFolder, 'Rank_DiamDiff_ByMean.csv'));
+writetable(Rank_Diff_CV,    fullfile(dataFolder, 'Rank_DiamDiff_ByCV.csv'));
+
+fprintf('  10 ranking CSV files written to: %s\n\n', dataFolder);
+
+
+
+
+
+fprintf('  Circularity        — best mean : %s mm | most consistent (CV) : %s mm\n', ...
+    Rank_Circ_Mean.Hole_mm{1}, Rank_Circ_CV.Hole_mm{1});
+fprintf('  Solidity           — best mean : %s mm | most consistent (CV) : %s mm\n', ...
+    Rank_Sol_Mean.Hole_mm{1}, Rank_Sol_CV.Hole_mm{1});
+fprintf('  Roundness          — best mean : %s mm | most consistent (CV) : %s mm\n', ...
+    Rank_Round_Mean.Hole_mm{1}, Rank_Round_CV.Hole_mm{1});
+fprintf('  Aspect Ratio       — best mean : %s mm | most consistent (CV) : %s mm\n', ...
+    Rank_AR_Mean.Hole_mm{1}, Rank_AR_CV.Hole_mm{1});
+fprintf('  Diameter Difference— best mean : %s mm | most consistent (CV) : %s mm\n', ...
+    Rank_Diff_Mean.Hole_mm{1}, Rank_Diff_CV.Hole_mm{1});
+
+fprintf('\nMain CSV outputs written to:\n');
+fprintf('  %s\n', csvFocus);
+fprintf('  %s\n', csvRaw);
+fprintf('  %s\n', csvCV);
+fprintf('  (plus 10 individual per-parameter ranking CSVs — see Section 23)\n');
+
+fprintf('\nAnalysis complete.  Total figures generated: 19\n');
+
+
+
+
+function S = makeNaNStruct()
+%MAKENANSTRUCT  Returns a struct with all measurement fields set to NaN.
+%               Used as a placeholder when a CSV file cannot be found or
+%               read, so the rest of the script can continue running.
+    fields = {'Area','Perim','Major','Minor','Circ', ...
+              'Feret','MinFeret','AR','Round','Solidity'};
+    for f = 1:numel(fields)
+        S.(fields{f}) = NaN;
+    end
+end
+
+function val = extractCol(T, candidates)
+%EXTRACTCOL  Searches table T for the first matching column name from the
+%            candidates list (to tolerate naming variants such as "Circ."
+%            vs "Circ") and returns its numeric values. Returns NaN if no
+%            matching column is found.
+    val = NaN;
+    for k = 1:numel(candidates)
+        if any(strcmp(T.Properties.VariableNames, candidates{k}))
+            val = T.(candidates{k});
+            if isnumeric(val)
+                return
+            end
+        end
+    end
+end 
