@@ -1,0 +1,773 @@
+% X-ray Pinhole and Film Translation Script
+
+% A tungsten disc with one small pinhole is scanned across the circular
+% face of an X-ray source. At every position the pinhole lets X-rays
+% through to expose one spot on a piece of Gafchromic film; stepping the
+% pinhole over the whole face builds up a map of the source's emission
+%  
+%
+% Two independent XY systems are involved:
+%    * PINHOLE moved by two Thorlabs NRT150/M stages via a 
+%	controller "BC203”.
+%    * FILM moved by two Thorlabs LTS150C/M stages, so a fresh unexposed
+%      patch sits under the beam for every new pinhole position.
+%
+% WHAT THIS SCRIPT DOES
+%   1) Builds the hexagonal grid of pinhole positions across the face and
+%      reconfirms the count analytically (SECTIONS 3-4).
+%   2) Orders the points into a scan path and plots it (SECTION 5).
+%   3) Lays out how many exposures fit per film sheet, and how many
+%      sheets are needed in total (SECTIONS 6-8).
+%   4) Converts every point into target positions (mm) for all FOUR
+%      stages, and works out which of the four actually need to move at
+%      each step (SECTIONS 9-10).
+%   5) Builds one master table, prints a summary, exports to Excel
+%      (SECTIONS 11-13).
+%   6) Provides an OPTIONAL, disabled-by-default hardware-execution
+%      section that would drive the real stages through the plan
+%      (SECTION 14) 
+%
+%  
+clc;
+clear;
+close all;
+
+
+%% SECTION 1 - User-Configurable Parameters
+% X-ray source output face & pinhole 
+faceDiameter_mm      = 14.0;  % Diameter of the circular X-ray output face
+pinholeDiameter_mm   = 0.5;   % Diameter of the pinhole in the tungsten disc
+pinholeSpacingFactor = 1.0;   % Pinhole-position pitch as a multiple of
+                               % pinholeDiameter_mm (1.0 = touching, no gap
+                               % or overlap; >1 = gap; <1 = overlap).
+
+% Scan path 
+scanPattern = 'raster';  % 'spiral' = centre-outward (point 1 = centre =
+                          %   home position, matching the "point 1 at
+                          %   rest" example).
+                          % 'raster' = row-by-row serpentine, minimises
+                          %   pinhole travel distance.
+
+% Which pinhole positions to keep 
+requireFullPinholeInsideFace = true;
+                          % false = keep points whose CENTRE is inside the
+                          %   face (edge points may have a "partial
+                          %   circle" poking past the rim).
+                          % true  = keep only points whose WHOLE pinhole
+                          %   circle fits inside the face (no partial
+                          %   circles); shrinks the usable radius by one
+                          %   pinhole radius, so fewer points result.
+
+% Gafchromic film 
+% "2 cm x 2.5 cm diameter" is read as a 20x25 mm RECTANGULAR sheet. For a
+% circular film disc, set filmShape='circular' and use filmDiameter_mm.
+
+filmShape       = 'rectangular';  % 'rectangular' or 'circular'
+filmWidth_mm    = 70.0;           % used when filmShape = 'rectangular'
+filmHeight_mm   = 140.0;          % used when filmShape = 'rectangular'
+filmDiameter_mm = 20.0;           % used when filmShape = 'circular'
+
+% Which physical corner of the film sheet exposure spot #1 is at (the
+% spot the scan fills first). The grid is then filled row-by-row starting
+% from that corner (along the bottom/top row first, left-to-right or
+% right-to-left) until the sheet is full. This is a NUMBERING/ORDERING
+% choice only -- it does not change where LTS_X_home_mm/LTS_Y_home_mm
+% point physically; rather, YOU choose which corner to calibrate as home
+% (see the note above LTS_X_home_mm below) to match whichever corner you
+% pick here.
+
+filmStartCorner = 'bottom-left';  % 'bottom-left' | 'bottom-right' | 'top-left' | 'top-right'
+
+spotSize_mm       = 4.0;  % Max exposed footprint per shot, modelled as a
+                           % spotSize_mm x spotSize_mm square.
+spotGap_mm        = 2.0;  % Clear gap kept between neighbouring spots
+                           % (avoids overlap/bleed between exposures).
+filmEdgeMargin_mm = 2.0;  % Clear margin kept between any spot and the
+                           % sheet edge.
+
+plotOnlyUsedFilmSpots = true;  % true = SECTION 8's figure only draws the
+                                % spots a real point is assigned to on
+                                % filmNumberToPlot (hides unused template
+                                % capacity). false = draw full capacity.
+filmNumberToPlot = 1;           % Which sheet to draw (1 = first used).
+
+% 	Pinhole-camera geometry (compensates the film position for the
+%      beam-shift caused by moving the pinhole -- see SECTION 9) 
+
+L1_sourceToPinhole_mm = 10.0;   % Source-to-pinhole distance. PLACEHOLDER.
+L2_pinholeToFilm_mm   = 400.0;  % Pinhole-to-film distance. PLACEHOLDER.
+applyMagnificationCompensation = false;  % Set false only if the beam-shift
+                                 % from moving the pinhole is negligible.
+
+NRT_X_home_mm = 75.0;   NRT_Y_home_mm = 75.0;
+LTS_X_home_mm = 75.0;   LTS_Y_home_mm = 75.0;
+
+% 	Mechanical direction signs: flip to -1 if a stage's positive
+%      direction is mounted backwards relative to this script's +X/+Y 
+
+nrtXSign = 1;   nrtYSign = 1;
+ltsXSign = 1;   ltsYSign = 1;
+
+stageTravelMin_mm = 0.0;    % Used only to flag out-of-range targets.
+stageTravelMax_mm = 150.0;
+moveTolerance_mm  = 1e-3;   % Tolerance for deciding if a stage "moved".
+
+outputFolder  = pwd;
+excelFileName = fullfile(outputFolder, 'stage_move_plan.xlsx');
+
+ENABLE_HARDWARE_EXECUTION = false; % false until SECTION 14 has been
+                                     % verified against Kinesis .NET
+                                     % API and real serial numbers.
+
+RUN_CALIBRATION_HELPER = false; % true = SECTION 14, instead of running
+                                  % the scan, connects+homes the stages and
+                                  % walks you through recording the real
+                                  % NRT_*_home_mm / LTS_*_home_mm values
+                                  % above (see the calibration note there).
+                                  % Only has any effect if
+                                  % ENABLE_HARDWARE_EXECUTION = true too.
+
+INTERACTIVE_MODE = true; % %	true = before every point, SECTION 14 prints
+                           %   what it is about to do (which stages move,
+                           %   and to where) and waits for you to press
+                           %   Enter before moving (type q + Enter to stop
+                           %   early). After moving, it always still waits
+                           %   for you to press Enter once you have
+                           %   energised the X-ray source and the exposure
+                           %   is done -- that pause happens either way,
+                           %   since firing the source is a manual step
+                           %   this script does not control.
+                           % false = skip the "confirm before moving"
+                           %   pause and move straight to each point
+                           %   without asking; the "exposure done, press
+                           %   Enter" pause still happens every time.
+
+% 	 Hardware timing constants (only used if ENABLE_HARDWARE_EXECUTION)
+MOVE_TIMEOUT_MS = 60000;          % 60,000 ms = 60 s. Max time MoveTo()/
+                                   % Home() will wait for a move to finish
+                                   % before raising a timeout error. A
+                                   % 150 mm stage crossing its full range
+                                   % should comfortably finish well inside
+                                   % this; raise it only if you see
+                                   % timeout errors on long moves.
+POLL_INTERVAL_MS = 250;           % How often (ms) Kinesis refreshes each
+                                   % stage's status/position in the
+                                   % background once StartPolling () is
+                                   % called -- 250 ms is Thorlabs' own
+                                   % standard example value.
+SETTINGS_INIT_TIMEOUT_MS = 5000; % Max time (ms) to wait for a freshly
+                                   % connected stage to finish loading its
+                                   % configuration before giving up.
+
+
+%% SECTION 2 -- Derived Geometry & Sanity Checks
+faceRadius_mm     = faceDiameter_mm / 2;
+pinholeRadius_mm  = pinholeDiameter_mm / 2;
+pinholeSpacing_mm = pinholeSpacingFactor * pinholeDiameter_mm;
+
+if pinholeDiameter_mm >= faceDiameter_mm
+    error('pinholeDiameter_mm must be smaller than faceDiameter_mm.');
+end
+if pinholeSpacing_mm <= 0
+    error('pinholeSpacingFactor must be positive.');
+end
+
+faceArea_mm2 = pi * faceRadius_mm^2;
+
+% pointInclusionRadius_mm decides which grid points survive (SECTION 3).
+% The true face boundary (faceRadius_mm) is still what gets plotted.
+if requireFullPinholeInsideFace
+    % A point's farthest circle edge is at (centre distance + pinholeRadius);
+    % requiring that <= faceRadius means centre distance <= faceRadius - pinholeRadius.
+    pointInclusionRadius_mm = faceRadius_mm - pinholeRadius_mm;
+    if pointInclusionRadius_mm <= 0
+        error('requireFullPinholeInsideFace leaves no room: pinholeDiameter_mm too large for faceDiameter_mm.');
+    end
+else
+    pointInclusionRadius_mm = faceRadius_mm;
+end
+
+fprintf('=== SECTION 2: Geometry ===\n');
+fprintf('Face diameter %.3f mm (radius %.3f mm, area %.2f mm^2) | pinhole %.3f mm | pitch %.3f mm\n', ...
+    faceDiameter_mm, faceRadius_mm, faceArea_mm2, pinholeDiameter_mm, pinholeSpacing_mm);
+fprintf('Point-inclusion radius: %.3f mm%s\n\n', pointInclusionRadius_mm, ...
+    ternaryStr(requireFullPinholeInsideFace, ' (shrunk by 1 pinhole radius: only complete circles kept)', ' (= full face radius: partial edge circles kept)'));
+
+
+%% SECTION 3 -- Hexagonal Pinhole-Position Grid
+
+% Hexagonal packing is the densest possible arrangement of equal circles,
+% so it gives the most non-overlapping pinhole positions for a given pitch.
+%
+% ANALYTIC CROSS-CHECK: in an infinite hex lattice of pitch s, each point
+% owns a Voronoi cell of area (sqrt(3)/2)*s^2, so faceArea/cellArea is an
+% upper-bound point-count estimate (an upper bound because rim points lose
+% part of their cell to the face boundary):
+
+analyticEstimate = faceArea_mm2 / ((sqrt(3)/2) * pinholeSpacing_mm^2);
+fprintf('=== SECTION 3: Hexagonal grid ===\n');
+fprintf('Analytic upper-bound estimate: %.1f points\n', analyticEstimate);
+
+% Build the finite grid, keeping points within pointInclusionRadius_mm.
+[gridX_mm, gridY_mm, gridRowIdx] = generateHexGridPoints(pointInclusionRadius_mm, pinholeSpacing_mm);
+nPoints = numel(gridX_mm);
+fprintf('Actual point count used by this script: %d (edge effects on a finite circle always reduce it below the estimate)\n\n', nPoints);
+
+
+%% SECTION 4 - Order the Grid Points into a Scan Path
+%  
+switch lower(scanPattern)
+    case 'spiral'
+        scanOrder = spiralOrderIndices(gridX_mm, gridY_mm);   % centre-outward
+    case 'raster'
+        scanOrder = rasterOrderIndices(gridX_mm, gridY_mm, gridRowIdx);  % serpentine rows
+    otherwise
+        error('scanPattern must be ''spiral'' or ''raster''.');
+end
+orderedX = gridX_mm(scanOrder);
+orderedY = gridY_mm(scanOrder);
+
+% Zero-padded nomenclature, e.g. P001, P002, ...
+nDigits = max(3, numel(num2str(nPoints)));
+pointID = arrayfun(@(k) sprintf('P%0*d', nDigits, k), (1:nPoints)', 'UniformOutput', false);
+
+
+%% SECTION 5 - Visualise the Output Face, Pinhole Positions & Scan Path
+%  
+figure('Name', 'X-ray Output Face - Pinhole Scan Plan', 'Color', 'w');
+hold on; axis equal; grid on; box on;
+
+plotCircleLocal(0, 0, faceRadius_mm, [0 0 0], 2.0);   % face boundary
+for k = 1:nPoints
+    plotCircleLocal(orderedX(k), orderedY(k), pinholeRadius_mm, [0.00 0.45 0.74], 0.75);
+end
+for k = 1:nPoints-1   % direction-of-travel arrows
+    quiver(orderedX(k), orderedY(k), orderedX(k+1)-orderedX(k), orderedY(k+1)-orderedY(k), 0, ...
+        'Color', [0.85 0.33 0.10], 'LineWidth', 0.75, 'MaxHeadSize', 0.6);
+end
+
+labelStride = max(1, round(nPoints/60));   % thin labels out on large scans
+for k = 1:labelStride:nPoints
+    text(orderedX(k), orderedY(k), pointID{k}, 'FontSize', 6, ...
+        'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+end
+
+plot(0, 0, 'k+', 'MarkerSize', 12, 'LineWidth', 1.5);
+xlabel('X offset from face centre (mm)'); ylabel('Y offset from face centre (mm)');
+title(sprintf('Output face (%.1f mm dia.) - %d pinhole positions - %s scan', faceDiameter_mm, nPoints, scanPattern));
+xlim([-faceRadius_mm faceRadius_mm]*1.15); ylim([-faceRadius_mm faceRadius_mm]*1.15);
+saveas(gcf, fullfile(outputFolder, 'face_scan_plan.png'));
+
+
+%% SECTION 6 - Film Spot Layout (Exposures per Sheet)
+%  
+% spotGap_mm keeps clear film between spots so exposures can't bleed
+% together or be confused with each other after development.
+[spotX_mm, spotY_mm, spotRowLabel, spotColLabel, nSpotRows, nSpotCols] = ...
+    buildFilmSpotGrid(filmWidth_mm, filmHeight_mm, spotSize_mm, spotGap_mm, ...
+                       filmEdgeMargin_mm, filmShape, filmDiameter_mm, filmStartCorner);
+spotsPerFilm = numel(spotX_mm);
+
+naiveSpotEstimate = floor(filmWidth_mm/spotSize_mm) * floor(filmHeight_mm/spotSize_mm);  % ignores gap/margin
+filmsNeeded = ceil(nPoints / spotsPerFilm);
+
+fprintf('=== SECTION 6: Film spot layout ===\n');
+fprintf('Naive no-gap estimate: %d spots/sheet | Actual with %.1f mm gap, %.1f mm margin: %d spots/sheet (%d x %d)\n', ...
+    naiveSpotEstimate, spotGap_mm, filmEdgeMargin_mm, spotsPerFilm, nSpotRows, nSpotCols);
+fprintf('%d points to expose -> %d film sheet(s) required\n', nPoints, filmsNeeded);
+fprintf('Spot #1 (first one exposed on every sheet) is at the %s corner, (%.2f, %.2f) mm from sheet centre -- this is what LTS_X_home_mm/LTS_Y_home_mm (SECTION 1) must be calibrated to.\n\n', ...
+    filmStartCorner, spotX_mm(1), spotY_mm(1));
+
+
+%% SECTION 7 - Assign Every Scan Point to a Film Sheet + Spot
+%  
+% Points fill sheet #1 in scan order, then sheet #2, etc. Every fresh
+% sheet reuses the same physical spot grid (same holder registration).
+pointIndex0   = (0:nPoints-1)';
+filmNumber    = floor(pointIndex0 / spotsPerFilm) + 1;
+spotIdxInFilm = mod(pointIndex0, spotsPerFilm) + 1;
+spotRowAssigned = spotRowLabel(spotIdxInFilm);
+spotColAssigned = spotColLabel(spotIdxInFilm);
+
+% Spot position relative to the FIRST spot used on each sheet
+% (spotIdxInFilm==1 there always gives delta 0), which is what lets
+% SECTION 9 guarantee point 1 needs zero film-stage motion.
+spotDeltaX_mm = spotX_mm(spotIdxInFilm) - spotX_mm(1);
+spotDeltaY_mm = spotY_mm(spotIdxInFilm) - spotY_mm(1);
+
+
+%% SECTION 8 - Visualise the Film Spot Layout
+%  
+if filmNumberToPlot > filmsNeeded
+    error('filmNumberToPlot = %d but the plan only needs %d film sheet(s).', filmNumberToPlot, filmsNeeded);
+end
+
+if plotOnlyUsedFilmSpots
+    spotsUsedOnThisSheet = unique(spotIdxInFilm(filmNumber == filmNumberToPlot));
+else
+    spotsUsedOnThisSheet = (1:spotsPerFilm)';
+end
+nSpotsDrawn = numel(spotsUsedOnThisSheet);
+
+figure('Name', 'Gafchromic Film Spot Layout (per sheet)', 'Color', 'w');
+hold on; axis equal; grid on; box on;
+if strcmpi(filmShape, 'rectangular')
+    rectangle('Position', [-filmWidth_mm/2, -filmHeight_mm/2, filmWidth_mm, filmHeight_mm], 'EdgeColor', [0 0 0], 'LineWidth', 2.0);
+else
+    plotCircleLocal(0, 0, filmDiameter_mm/2, [0 0 0], 2.0);
+end
+for si = 1:nSpotsDrawn
+    s = spotsUsedOnThisSheet(si);
+    rectangle('Position', [spotX_mm(s)-spotSize_mm/2, spotY_mm(s)-spotSize_mm/2, spotSize_mm, spotSize_mm], ...
+        'EdgeColor', [0.00 0.45 0.74], 'LineWidth', 1.0);
+    text(spotX_mm(s), spotY_mm(s), sprintf('S%d', s), 'FontSize', 7, 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle');
+end
+xlabel('X on film (mm)'); ylabel('Y on film (mm)');
+if plotOnlyUsedFilmSpots
+    title(sprintf('Film sheet %d: %d spots used (of %d capacity) -> %d sheet(s) needed for %d points', ...
+        filmNumberToPlot, nSpotsDrawn, spotsPerFilm, filmsNeeded, nPoints));
+else
+    title(sprintf('Film spot template: %d spots/sheet -> %d sheets needed for %d points', spotsPerFilm, filmsNeeded, nPoints));
+end
+saveas(gcf, fullfile(outputFolder, 'film_layout.png'));
+
+if spotsPerFilm > nPoints && filmsNeeded == 1
+    fprintf('=== SECTION 8: Film capacity note ===\n');
+    fprintf('%d spots of capacity are unused on this sheet (%d capacity vs %d needed). Shrink the film or increase spotGap_mm/filmEdgeMargin_mm if you want a tighter fit.\n\n', ...
+        spotsPerFilm - nPoints, spotsPerFilm, nPoints);
+end
+
+
+%% SECTION 9 - Compute the Four Stage Target Positions for Every Point
+
+% PINHOLE (NRT150/M x2): moving the pinhole by offset (dx,dy) from the
+% face centre just means moving both stages by that offset from home.
+pinholeOffsetX_mm = orderedX;
+pinholeOffsetY_mm = orderedY;
+NRT_X_target_mm = NRT_X_home_mm + nrtXSign * pinholeOffsetX_mm;
+NRT_Y_target_mm = NRT_Y_home_mm + nrtYSign * pinholeOffsetY_mm;
+
+% FILM (LTS150C/M x2): NOT just "move to the next spot". The X-ray source
+% sits at a fixed point, so moving the pinhole also shifts the beam's
+% central ray at the film plane, like any pinhole camera. With source at
+% distance 0, pinhole at distance L1 offset by (dx,dy), the ray projected
+% to the film at distance L1+L2 lands at (dx,dy)*(L1+L2)/L1 = M*(dx,dy),
+% where M is the pinhole-camera magnification. Left uncompensated, the
+% exposed spot would drift by M*(dx,dy) as the pinhole scans. So the film
+% stage must move by (M*offset - spotDelta): chase the beam shift, then
+% step across to the next spot.
+if applyMagnificationCompensation
+    M_eff = (L1_sourceToPinhole_mm + L2_pinholeToFilm_mm) / L1_sourceToPinhole_mm;
+else
+    M_eff = 0;   % film target then depends only on which spot is filled
+end
+LTS_X_target_mm = LTS_X_home_mm + ltsXSign * (M_eff .* pinholeOffsetX_mm - spotDeltaX_mm);
+LTS_Y_target_mm = LTS_Y_home_mm + ltsYSign * (M_eff .* pinholeOffsetY_mm - spotDeltaY_mm);
+% Point 1 has pinholeOffset=(0,0) and spotDelta=(0,0), so all four targets
+% above exactly equal "home" there -- zero motion, as expected.
+
+checkStageRange('NRT_X', NRT_X_target_mm, stageTravelMin_mm, stageTravelMax_mm, pointID);
+checkStageRange('NRT_Y', NRT_Y_target_mm, stageTravelMin_mm, stageTravelMax_mm, pointID);
+checkStageRange('LTS_X', LTS_X_target_mm, stageTravelMin_mm, stageTravelMax_mm, pointID);
+checkStageRange('LTS_Y', LTS_Y_target_mm, stageTravelMin_mm, stageTravelMax_mm, pointID);
+
+
+%% SECTION 10 -- Which Stages Actually Move at Each Step
+
+% Compares each point's four targets to the PREVIOUS point's (point 1 is
+% compared to the home values, i.e. the state right after homing).
+prevNRT_X = [NRT_X_home_mm; NRT_X_target_mm(1:end-1)];
+prevNRT_Y = [NRT_Y_home_mm; NRT_Y_target_mm(1:end-1)];
+prevLTS_X = [LTS_X_home_mm; LTS_X_target_mm(1:end-1)];
+prevLTS_Y = [LTS_Y_home_mm; LTS_Y_target_mm(1:end-1)];
+
+moveNRT_X = abs(NRT_X_target_mm - prevNRT_X) > moveTolerance_mm;
+moveNRT_Y = abs(NRT_Y_target_mm - prevNRT_Y) > moveTolerance_mm;
+moveLTS_X = abs(LTS_X_target_mm - prevLTS_X) > moveTolerance_mm;
+moveLTS_Y = abs(LTS_Y_target_mm - prevLTS_Y) > moveTolerance_mm;
+numStagesMoving = double(moveNRT_X) + double(moveNRT_Y) + double(moveLTS_X) + double(moveLTS_Y);
+
+
+%% SECTION 11 -- Assemble the Master Results Table
+
+radialDistance_mm = sqrt(pinholeOffsetX_mm.^2 + pinholeOffsetY_mm.^2);
+
+resultsTable = table( ...
+    (1:nPoints)', pointID, pinholeOffsetX_mm, pinholeOffsetY_mm, radialDistance_mm, ...
+    filmNumber, spotIdxInFilm, spotRowAssigned, spotColAssigned, ...
+    NRT_X_target_mm, NRT_Y_target_mm, LTS_X_target_mm, LTS_Y_target_mm, ...
+    moveNRT_X, moveNRT_Y, moveLTS_X, moveLTS_Y, numStagesMoving, ...
+    'VariableNames', { ...
+        'ScanOrderIndex', 'PointID', 'Pinhole_X_mm', 'Pinhole_Y_mm', 'Pinhole_Radius_mm', ...
+        'FilmNumber', 'SpotIndexInFilm', 'SpotRow', 'SpotCol', ...
+        'NRT_StageX_target_mm', 'NRT_StageY_target_mm', 'LTS_StageX_target_mm', 'LTS_StageY_target_mm', ...
+        'NRT_StageX_moves', 'NRT_StageY_moves', 'LTS_StageX_moves', 'LTS_StageY_moves', 'NumStagesMoving'});
+
+
+%% SECTION 12 -- Command-Window Summary Report
+
+fprintf('=== SECTION 12: Scan plan summary ===\n');
+fprintf('Points: %d | Scan pattern: %s | Spots/sheet: %d | Sheets required: %d\n', nPoints, scanPattern, spotsPerFilm, filmsNeeded);
+fprintf('Pinhole-camera magnification M = %.3f (%s)\n\n', M_eff, ternaryStr(applyMagnificationCompensation, 'compensation applied', 'compensation OFF'));
+
+fprintf('Distribution of how many stages move per point:\n');
+for nMove = 0:4
+    fprintf('   %d stage(s) moving : %4d point(s)\n', nMove, sum(numStagesMoving == nMove));
+end
+fprintf('\n');
+
+printPointExample(resultsTable, 1);                    % should show zero motion
+printPointExample(resultsTable, min(134, nPoints));     % a mid-scan example
+
+
+
+%% SECTION 13 -- Export Results to Excel
+
+writetable(resultsTable, excelFileName, 'Sheet', 'StageMovePlan');
+
+paramNames = {'faceDiameter_mm'; 'pinholeDiameter_mm'; 'pinholeSpacing_mm'; 'scanPattern'; ...
+    'filmShape'; 'filmWidth_mm'; 'filmHeight_mm'; 'filmDiameter_mm'; 'spotSize_mm'; ...
+    'spotGap_mm'; 'filmEdgeMargin_mm'; 'L1_sourceToPinhole_mm'; 'L2_pinholeToFilm_mm'; ...
+    'applyMagnificationCompensation'; 'NRT_X_home_mm'; 'NRT_Y_home_mm'; 'LTS_X_home_mm'; 'LTS_Y_home_mm'; ...
+    'nPoints'; 'spotsPerFilm'; 'filmsNeeded'};
+paramValues = {faceDiameter_mm; pinholeDiameter_mm; pinholeSpacing_mm; scanPattern; ...
+    filmShape; filmWidth_mm; filmHeight_mm; filmDiameter_mm; spotSize_mm; ...
+    spotGap_mm; filmEdgeMargin_mm; L1_sourceToPinhole_mm; L2_pinholeToFilm_mm; ...
+    applyMagnificationCompensation; NRT_X_home_mm; NRT_Y_home_mm; LTS_X_home_mm; LTS_Y_home_mm; ...
+    nPoints; spotsPerFilm; filmsNeeded};
+writetable(table(paramNames, paramValues, 'VariableNames', {'Parameter', 'Value'}), excelFileName, 'Sheet', 'Parameters');
+
+% A third sheet spelling out what every StageMovePlan column means, so the
+% Excel file is self-explanatory without needing this script open too.
+colGuideNames = {'NRT_StageX_target_mm'; 'NRT_StageY_target_mm'; 'LTS_StageX_target_mm'; 'LTS_StageY_target_mm'; ...
+    'NRT_StageX_moves'; 'NRT_StageY_moves'; 'LTS_StageX_moves'; 'LTS_StageY_moves'; 'NumStagesMoving'};
+colGuideMeaning = { ...
+    'Absolute position (mm, 0-150) to command pinhole stage 1 (X) to for this point = NRT_X_home_mm + pinhole X offset.'; ...
+    'Absolute position (mm, 0-150) to command pinhole stage 2 (Y) to for this point = NRT_Y_home_mm + pinhole Y offset.'; ...
+    'Absolute position (mm, 0-150) to command film stage 3 (X) to for this point = LTS_X_home_mm + beam-shift compensation - spot step.'; ...
+    'Absolute position (mm, 0-150) to command film stage 4 (Y) to for this point = LTS_Y_home_mm + beam-shift compensation - spot step.'; ...
+    'TRUE if NRT stage 1 (X) target differs from where it already was after the previous point -- FALSE means it can be left alone for this point.'; ...
+    'Same as above, for NRT stage 2 (pinhole Y).'; ...
+    'Same as above, for LTS stage 3 (film X).'; ...
+    'Same as above, for LTS stage 4 (film Y).'; ...
+    'Count (0-4) of how many of the four *_moves flags are TRUE for this point -- i.e. how many of the four stages actually need to move.'};
+writetable(table(colGuideNames, colGuideMeaning, 'VariableNames', {'Column', 'Meaning'}), excelFileName, 'Sheet', 'ColumnGuide');
+
+fprintf('=== SECTION 13: Export complete ===\n');
+fprintf('Table   : %s\n', excelFileName);
+fprintf('Figures : %s\n          %s\n\n', fullfile(outputFolder, 'face_scan_plan.png'), fullfile(outputFolder, 'film_layout.png'));
+
+
+%% SECTION 14 -- (OPTIONAL / DISABLED BY DEFAULT) Hardware Execution
+
+
+%  A TEMPLATE for driving the four stages, in one of two modes selected by
+%  RUN_CALIBRATION_HELPER (SECTION 1):
+%    RUN_CALIBRATION_HELPER = true  -> connects+homes the stages, then lets
+%      you jog them by hand into alignment and reads back the position for
+%      you to copy into SECTION 1 (see the note above NRT_X_home_mm).
+%      Nothing in resultsTable is used in this mode -- it is a one-off
+%      setup step you run once, BEFORE trusting the plan.
+%    RUN_CALIBRATION_HELPER = false -> runs the actual scan from
+%      resultsTable, honouring INTERACTIVE_MODE (SECTION 1).
+%
+%  The film side (LTS150C/M / LongTravelStage) reuses the user's own
+%  working example unchanged and can be trusted. The pinhole side assumes
+%  the user's "BC203" is a Thorlabs BBD203 (3-channel Benchtop Brushless
+%  DC Motor Controller); the class names used below (BenchtopBrushlessMotor,
+%  .GetChannel(n)) follow the pattern every other multi-channel Kinesis
+%  .NET "Benchtop" controller uses (e.g. BenchtopStepperMotor for BSC20x),
+%  but this exact class/assembly has NOT been verified against the
+%  Kinesis .NET API reference -- likewise the .Position property used by
+%  the calibration helper below to read a stage's current location back
+%  (it may be named .Position, .DevicePosition, or reached via a
+%  GetPosition() method depending on your Kinesis version). BEFORE ENABLING:
+%    1. Confirm the exact assembly filename, class name, channel method,
+%       and position-readback property/method in
+%       Thorlabs.MotionControl.DotNet_API.chm or the official BBD203 C#
+%       example for your installed Kinesis version.
+%    2. Fix the placeholders below (assembly path, class name, serials,
+%       channels) to match.
+%    3. Test with the X-ray source OFF and stages homed to a safe range
+%       before trusting this against real hardware.
+%  With ENABLE_HARDWARE_EXECUTION = false (SECTION 1 default) nothing
+%  below runs.
+
+if ENABLE_HARDWARE_EXECUTION
+
+    % 14a -- Load Kinesis .NET assemblies
+    NET.addAssembly('C:\Program Files\Thorlabs\Kinesis\Thorlabs.MotionControl.DeviceManagerCLI.dll');
+    NET.addAssembly('C:\Program Files\Thorlabs\Kinesis\Thorlabs.MotionControl.GenericMotorCLI.dll');
+    NET.addAssembly('C:\Program Files\Thorlabs\Kinesis\Thorlabs.MotionControl.IntegratedStepperMotorsCLI.dll'); % LTS150C/M -- confirmed pattern
+    NET.addAssembly('C:\Program Files\Thorlabs\Kinesis\Thorlabs.MotionControl.Benchtop.BrushlessMotorCLI.dll');  % NRT150/M via BBD203 -- VERIFY before use
+    import Thorlabs.MotionControl.DeviceManagerCLI.*;
+    import Thorlabs.MotionControl.GenericMotorCLI.*;
+    import Thorlabs.MotionControl.IntegratedStepperMotorsCLI.*;
+    import Thorlabs.MotionControl.Benchtop.BrushlessMotorCLI.*;
+    DeviceManagerCLI.BuildDeviceList();
+
+    % 14b -- Serial/channel numbers -- EDIT for your rig
+    LTS_X_SERIAL  = '45800001';   % Film stage 1 (X) - LTS150C/M
+    LTS_Y_SERIAL  = '45800002';   % Film stage 2 (Y) - LTS150C/M
+    BBD203_SERIAL = '73800001';   % Benchtop controller for both pinhole axes
+    NRT_X_CHANNEL = 1;
+    NRT_Y_CHANNEL = 2;
+
+    % 14c -- Connect & home the film stages. pause(1) after Connect() gives
+    % the USB/serial link a moment to settle before the next command;
+    % pause(3) after StartPolling()/EnableDevice() gives the background
+    % polling loop and drive electronics time to fully engage before any
+    % motion command is issued -- both durations are carried over unchanged
+    % from the user's own working LTS150C/M example script.
+    ltsX = LongTravelStage.CreateLongTravelStage(LTS_X_SERIAL);
+    ltsY = LongTravelStage.CreateLongTravelStage(LTS_Y_SERIAL);
+    ltsX.Connect(LTS_X_SERIAL); ltsY.Connect(LTS_Y_SERIAL);
+    pause(1);
+    if ~ltsX.IsSettingsInitialized(), ltsX.WaitForSettingsInitialized(SETTINGS_INIT_TIMEOUT_MS); end
+    if ~ltsY.IsSettingsInitialized(), ltsY.WaitForSettingsInitialized(SETTINGS_INIT_TIMEOUT_MS); end
+    ltsX.StartPolling(POLL_INTERVAL_MS); ltsY.StartPolling(POLL_INTERVAL_MS); pause(3);
+    ltsX.EnableDevice(); ltsY.EnableDevice(); pause(3);
+    disp('Homing film stages (LTS150C/M x2)...');
+    ltsX.Home(MOVE_TIMEOUT_MS); ltsY.Home(MOVE_TIMEOUT_MS);
+
+    % 14d -- Connect & home the pinhole controller (NRT150/M via BBD203)
+    bbd203 = BenchtopBrushlessMotor.CreateBenchtopBrushlessMotor(BBD203_SERIAL); %#ok<*UNRCH> -- VERIFY class name
+    bbd203.Connect(BBD203_SERIAL);
+    pause(1);
+    nrtX = bbd203.GetChannel(NRT_X_CHANNEL);
+    nrtY = bbd203.GetChannel(NRT_Y_CHANNEL);
+    if ~nrtX.IsSettingsInitialized(), nrtX.WaitForSettingsInitialized(SETTINGS_INIT_TIMEOUT_MS); end
+    if ~nrtY.IsSettingsInitialized(), nrtY.WaitForSettingsInitialized(SETTINGS_INIT_TIMEOUT_MS); end
+    nrtX.StartPolling(POLL_INTERVAL_MS); nrtY.StartPolling(POLL_INTERVAL_MS); pause(3);
+    nrtX.EnableDevice(); nrtY.EnableDevice(); pause(3);
+    disp('Homing pinhole stages (NRT150/M x2 via BBD203)...');
+    nrtX.Home(MOVE_TIMEOUT_MS); nrtY.Home(MOVE_TIMEOUT_MS);
+    disp('All four stages homed and ready.');
+
+    if RUN_CALIBRATION_HELPER
+        % 14e-CAL -- One-off: jog each pair into alignment by hand, read the
+        % position back, and tell you exactly what to paste into SECTION 1.
+        runCalibrationHelper('pinhole (NRT150/M x2)', nrtX, nrtY, 'NRT_X_home_mm / NRT_Y_home_mm');
+        runCalibrationHelper(sprintf('film (LTS150C/M x2) -- position the %s corner spot under the beam', filmStartCorner), ltsX, ltsY, 'LTS_X_home_mm / LTS_Y_home_mm');
+        disp('Calibration finished. Update SECTION 1 with the values printed above, set RUN_CALIBRATION_HELPER = false, then re-run to execute the scan.');
+
+    else
+        % 14e -- Step through the plan, moving only flagged stages
+        currentFilm = 0;
+        for k = 1:height(resultsTable)
+            row = resultsTable(k, :);
+
+            if row.FilmNumber ~= currentFilm
+                currentFilm = row.FilmNumber;
+                fprintf('\n>>> Load/position Gafchromic film sheet #%d, then press Enter.\n', currentFilm);
+                input('', 's');
+            end
+
+            % Always describe the upcoming move before touching any stage.
+            fprintf('\n[%d/%d] %s : NRT_X %s %.4f | NRT_Y %s %.4f | LTS_X %s %.4f | LTS_Y %s %.4f  (%d/4 stages moving)\n', ...
+                k, height(resultsTable), row.PointID{1}, ...
+                ternaryStr(row.NRT_StageX_moves, 'MOVE ->', 'stays at'), row.NRT_StageX_target_mm, ...
+                ternaryStr(row.NRT_StageY_moves, 'MOVE ->', 'stays at'), row.NRT_StageY_target_mm, ...
+                ternaryStr(row.LTS_StageX_moves, 'MOVE ->', 'stays at'), row.LTS_StageX_target_mm, ...
+                ternaryStr(row.LTS_StageY_moves, 'MOVE ->', 'stays at'), row.LTS_StageY_target_mm, ...
+                row.NumStagesMoving);
+
+            if INTERACTIVE_MODE
+                goAhead = input('Press Enter to execute this move (or type q + Enter to stop): ', 's');
+                if strcmpi(goAhead, 'q')
+                    disp('Stopped by user request before completing the scan.');
+                    break;
+                end
+            end
+
+            if row.NRT_StageX_moves, nrtX.MoveTo(row.NRT_StageX_target_mm, MOVE_TIMEOUT_MS); end
+            if row.NRT_StageY_moves, nrtY.MoveTo(row.NRT_StageY_target_mm, MOVE_TIMEOUT_MS); end
+            if row.LTS_StageX_moves, ltsX.MoveTo(row.LTS_StageX_target_mm, MOVE_TIMEOUT_MS); end
+            if row.LTS_StageY_moves, ltsY.MoveTo(row.LTS_StageY_target_mm, MOVE_TIMEOUT_MS); end
+
+            % This pause always happens, in both INTERACTIVE_MODE settings,
+            % because firing the X-ray source is a manual step outside this
+            % script's control -- there is nothing to automate here yet.
+            fprintf('In position for %s (%d/%d). Energise the X-ray source now, then press Enter once the exposure is complete.\n', ...
+                row.PointID{1}, k, height(resultsTable));
+            input('', 's');
+        end
+        disp('Scan complete (or stopped early -- see above).');
+    end
+
+    % 14f -- Shut down (runs after either branch above)
+    ltsX.StopPolling(); ltsY.StopPolling();
+    nrtX.StopPolling(); nrtY.StopPolling();
+    ltsX.Disconnect(true); ltsY.Disconnect(true);
+    bbd203.Disconnect(true);
+    disp('All stages disconnected.');
+
+else
+    disp('SECTION 14 (hardware execution) skipped: ENABLE_HARDWARE_EXECUTION = false.');
+    disp('Set true in SECTION 1 only after verifying SECTION 14 against your Kinesis .NET API and real serial numbers.');
+end
+
+
+%% =======================================================================
+%  LOCAL FUNCTIONS (must follow all script code; still callable from above)
+%  =======================================================================
+
+function [x, y, rowIdx] = generateHexGridPoints(faceRadius_mm, spacing_mm)
+% Hexagonal (honeycomb) grid: alternate rows offset by spacing/2, row
+% height spacing*sqrt(3)/2 -- the standard hex close-packed construction.
+% Keeps candidate points whose centre lies within faceRadius_mm.
+    rowHeight = spacing_mm * sqrt(3) / 2;
+    nRowsHalf = ceil(faceRadius_mm / rowHeight) + 1;
+    x = zeros(0, 1); y = zeros(0, 1); rowIdx = zeros(0, 1);
+    for r = -nRowsHalf:nRowsHalf
+        yv = r * rowHeight;
+        if abs(yv) > faceRadius_mm, continue; end
+        xOffset = mod(abs(r), 2) * (spacing_mm / 2);
+        nColsHalf = ceil(faceRadius_mm / spacing_mm) + 2;
+        for c = -nColsHalf:nColsHalf
+            xv = c * spacing_mm + xOffset;
+            if xv^2 + yv^2 <= faceRadius_mm^2
+                x(end+1, 1) = xv; y(end+1, 1) = yv; rowIdx(end+1, 1) = r; %#ok<AGROW>
+            end
+        end
+    end
+end
+
+function order = spiralOrderIndices(x, y)
+% Sort by increasing radius then angle -> approximate centre-outward
+% spiral (radial+angular sort, not a strict hex-ring spiral, but simple
+% and gives the desired centre-out behaviour).
+    radius = sqrt(x.^2 + y.^2);
+    theta = atan2(y, x);
+    theta(theta < 0) = theta(theta < 0) + 2*pi;
+    [~, order] = sortrows([radius, theta]);
+end
+
+function order = rasterOrderIndices(x, y, rowIdx)
+% Row by row using the hex-grid row index, alternating sweep direction
+% each row (serpentine/boustrophedon) to minimise travel distance.
+    uniqueRows = sort(unique(rowIdx));
+    order = zeros(0, 1);
+    goingRight = true;
+    for k = 1:numel(uniqueRows)
+        idxInRow = find(rowIdx == uniqueRows(k));
+        [~, sortIdx] = sort(x(idxInRow));
+        if ~goingRight, sortIdx = flipud(sortIdx(:)); end
+        order = [order; idxInRow(sortIdx)]; %#ok<AGROW>
+        goingRight = ~goingRight;
+    end
+end
+
+function [spotX, spotY, spotRowLabel, spotColLabel, nRows, nCols] = ...
+    buildFilmSpotGrid(filmWidth_mm, filmHeight_mm, spotSize_mm, spotGap_mm, edgeMargin_mm, filmShape, filmDiameter_mm, filmStartCorner)
+% Regular grid of square exposure spots, pitch = spotSize+spotGap, kept
+% edgeMargin_mm from the sheet edge. For 'circular' film, candidate spots
+% whose square footprint would cross the circular boundary are dropped.
+%
+% spotRowLabel/spotColLabel always number rows bottom-to-top and columns
+% left-to-right (a fixed physical reference), but filmStartCorner controls
+% the ORDER the two nested loops below visit them in, which is what
+% decides which physical spot ends up being spot #1 (the very first one
+% the scan uses on every sheet) -- e.g. 'top-right' visits the top row
+% first, right-to-left, so the top-right spot becomes spot #1.
+    pitch = spotSize_mm + spotGap_mm;
+    usableWidth  = filmWidth_mm  - 2*edgeMargin_mm;
+    usableHeight = filmHeight_mm - 2*edgeMargin_mm;
+    nCols = floor((usableWidth  - spotSize_mm) / pitch) + 1;
+    nRows = floor((usableHeight - spotSize_mm) / pitch) + 1;
+    if nCols < 1 || nRows < 1
+        error('Film too small for the requested spot size / gap / margin.');
+    end
+    colPos = linspace(-(nCols-1)*pitch/2, (nCols-1)*pitch/2, nCols);  % left(-) to right(+)
+    rowPos = linspace(-(nRows-1)*pitch/2, (nRows-1)*pitch/2, nRows);  % bottom(-) to top(+)
+
+    switch lower(filmStartCorner)
+        case 'bottom-left',  rowOrder = 1:nRows;      colOrder = 1:nCols;
+        case 'bottom-right', rowOrder = 1:nRows;      colOrder = nCols:-1:1;
+        case 'top-left',     rowOrder = nRows:-1:1;    colOrder = 1:nCols;
+        case 'top-right',    rowOrder = nRows:-1:1;    colOrder = nCols:-1:1;
+        otherwise
+            error('filmStartCorner must be ''bottom-left'', ''bottom-right'', ''top-left'' or ''top-right''.');
+    end
+
+    spotX = zeros(0,1); spotY = zeros(0,1); spotRowLabel = zeros(0,1); spotColLabel = zeros(0,1);
+    cornerReach = spotSize_mm * sqrt(2) / 2;   % half-diagonal of a square spot
+    filmRadius = filmDiameter_mm/2 - edgeMargin_mm;
+    for rr = rowOrder
+        for cc = colOrder
+            candX = colPos(cc); candY = rowPos(rr);
+            keepPoint = true;
+            if strcmpi(filmShape, 'circular')
+                keepPoint = (sqrt(candX^2 + candY^2) + cornerReach) <= filmRadius;
+            end
+            if keepPoint
+                spotX(end+1,1) = candX; spotY(end+1,1) = candY; %#ok<AGROW>
+                spotRowLabel(end+1,1) = rr; spotColLabel(end+1,1) = cc; %#ok<AGROW>
+            end
+        end
+    end
+    if isempty(spotX)
+        error('No film spots survived circular-film clipping -- check filmDiameter_mm / edgeMargin_mm / spotSize_mm.');
+    end
+end
+
+function plotCircleLocal(cx, cy, r, rgbColor, lineWidth)
+% Draws a circle with plain `plot` (core MATLAB) so no Image Processing
+% Toolbox / viscircles is required.
+    theta = linspace(0, 2*pi, 60);
+    plot(cx + r.*cos(theta), cy + r.*sin(theta), '-', 'Color', rgbColor, 'LineWidth', lineWidth);
+end
+
+function checkStageRange(stageName, targets_mm, lo_mm, hi_mm, pointID)
+% Warns (never silently clips) if any target falls outside stage travel.
+    badIdx = find(targets_mm < lo_mm | targets_mm > hi_mm);
+    if ~isempty(badIdx)
+        warning('%s: %d point(s) outside [%.1f, %.1f] mm. First: %s (%.3f mm).', ...
+            stageName, numel(badIdx), lo_mm, hi_mm, pointID{badIdx(1)}, targets_mm(badIdx(1)));
+    end
+end
+
+function printPointExample(resultsTable, k)
+% Human-readable per-stage printout for one row, e.g. "NRT stage 1 moves
+% to this; NRT stage 2 moves to that; ..."
+    row = resultsTable(k, :);
+    fprintf('--- Example: %s (scan order index %d) ---\n', row.PointID{1}, row.ScanOrderIndex);
+    fprintf('   Pinhole offset : (%.3f, %.3f) mm\n', row.Pinhole_X_mm, row.Pinhole_Y_mm);
+    fprintf('   Film sheet/spot: sheet %d, spot #%d (row %d, col %d)\n', row.FilmNumber, row.SpotIndexInFilm, row.SpotRow, row.SpotCol);
+    fprintf('   NRT stage 1 (pinhole X) : %s to %.4f mm\n', ternaryStr(row.NRT_StageX_moves, 'MOVES', 'stays'), row.NRT_StageX_target_mm);
+    fprintf('   NRT stage 2 (pinhole Y) : %s to %.4f mm\n', ternaryStr(row.NRT_StageY_moves, 'MOVES', 'stays'), row.NRT_StageY_target_mm);
+    fprintf('   LTS stage 3 (film X)    : %s to %.4f mm\n', ternaryStr(row.LTS_StageX_moves, 'MOVES', 'stays'), row.LTS_StageX_target_mm);
+    fprintf('   LTS stage 4 (film Y)    : %s to %.4f mm\n', ternaryStr(row.LTS_StageY_moves, 'MOVES', 'stays'), row.LTS_StageY_target_mm);
+    fprintf('   Total stages moving      : %d of 4\n\n', row.NumStagesMoving);
+end
+
+function s = ternaryStr(cond, ifTrue, ifFalse)
+% MATLAB has no ternary operator; this keeps the fprintf calls readable.
+    if cond, s = ifTrue; else, s = ifFalse; end
+end
+
+function runCalibrationHelper(pairLabel, stageX, stageY, targetVarNames)
+% Interactive one-off helper used by SECTION 14 when RUN_CALIBRATION_HELPER
+% = true. It does NOT move anything itself -- you physically jog the given
+% pair of already-connected, already-homed stages into alignment yourself
+% (using the Kinesis desktop software, or the controller's own hand/jog
+% control), by whatever external method tells you the alignment is
+% correct (a beam-finder/detector, a fluorescent screen, a symmetric test
+% exposure, or -- for the film -- simply the chosen corner of the sheet
+% sitting under the beam). Once you are satisfied, this function reads
+% back and prints the stage positions Kinesis is reporting at that exact
+% moment, so you can copy them into SECTION 1.
+    fprintf('\n=== Calibration: %s ===\n', pairLabel);
+    fprintf('Jog these two stages by hand (Kinesis software or the controller''s jog control)\n');
+    fprintf('until they are physically aligned the way you want.\n');
+    input('Press Enter once aligned, to read back the position...', 's');
+    % VERIFY: the position-readback call may be named .Position,
+    % .DevicePosition, or reached via a GetPosition() method depending on
+    % your Kinesis .NET version -- check before relying on this.
+    xPos = double(stageX.Position);
+    yPos = double(stageY.Position);
+    fprintf('Recorded position -> X = %.4f mm , Y = %.4f mm\n', xPos, yPos);
+    fprintf('Copy these into %s in SECTION 1.\n\n', targetVarNames);
+end
+
+
