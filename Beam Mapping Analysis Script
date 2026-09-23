@@ -1,0 +1,881 @@
+% Beam Mapping Analysis Script
+
+%
+clc;
+clear;
+close all;
+fprintf('  Beam Mapping Analysis \n');
+
+%% User Settings
+% X-ray source geometry
+source_diameter_mm   = 14.0;   % Diameter of the circular X-ray source output (mm)
+focal_spot_um        = 500;   % Size of the focal spot (micrometres)
+source_to_focal_mm   = 150;   % Distance from source face to focal spot (mm)
+half_angle_deg       = 2.7;   % Half-angle of beam convergence towards focal spot
+%                               (Full angle = 5.4 degrees, half = 2.7 degrees)
+%                               This is the angle the photon cone makes as it
+%                               converges.
+% Tungsten disc position
+source_to_disc_mm    = 10;    % The disc is assumed not placed right against the source.
+%                               It is expected that there will be a physical gap
+%                               of this size between the
+%                               X-ray output face and the tungsten disc.
+% Aperture on the tungsten disc
+aperture_diameter_mm = 0.50; % Diameter of the circular aperture in the disc (mm)
+% 
+
+
+aperture_spacing_factor            = 1.0;      % Pitch = 1.0 x aperture diameter (touching)
+
+require_full_aperture_inside_source = true;    % No partial apertures at the rim
+scan_pattern                        = 'raster'; % 'raster' (confirmed correct) or 'spiral'
+% Film (detector) settings
+
+film_size_mm         = 34;   % The Gafchromic film is square: 34 x 34 mm
+film_pixels          = 1360;  % XR-RV3 film resolution is 25 um
+%                               Simulated image resolution (pixels per side)
+%                              1360 pixels over 34 mm = 40 pixels per mm
+film_depth_mm        = 500;  % Distance from X-ray source face to the film (mm)
+%
+%% An example of film image for display
+%  Figure 2 shows a single film exposure for ONE aperture position.
+%
+%  Default - centre of the source face
+example_x_mm         = 0.0;   % X coordinate (mm) of the example position
+example_y_mm         = 0.0;   % Y coordinate (mm) of the example position
+%  To see a position near the edge instead, e.g.:  example_x_mm = 6; example_y_mm = 0;
+%  The nearest actual scan point to (example_x_mm, example_y_mm) is used;
+%  its true coordinates are reported when the script runs.
+%% Synthetic beam profile shape (Section 3)
+% Examples of beam profiles to be used are below.
+% One of them is chosen by setting others to false.
+use_gaussian_beam    = true;  % Standard 2D Gaussian (smooth bell shape)
+use_tophat_beam      = false; % Flat top with sharp circular edge (uniform disc)
+use_asymmetric_beam  = false; % Offset Gaussian — simulates a non-centred beam
+
+% Optional extra analyses
+% Any of these is set to true to run that additional analysis.
+run_radial_profile   = true;  % Radial (distance from centre) intensity profile
+run_encircled_energy = true;  % Encircled energy: how much signal within radius r
+run_gaussian_fit     = true;  % Fit a Gaussian mathematically to the reconstructed beam
+run_contour_plot     = true;  % Contour map of beam intensity levels
+% Noise and saving settings
+noise_level          = 0.05;  % Random noise added to synthetic film images
+%                               0 = none, 0.1 = quite noisy. Simulates film grain.
+store_all_films      = true;  % Store every film image in memory
+%                               true  = all film images are kept in RAM.
+%                               false = only the example image is kept (This saves memory).
+save_figures         = true; % Set to true to save all figures as PNG files
+output_folder        = 'C:\Users\padra\Desktop\Beam Mapping Code\Output'; % Folder name for saved figures
+
+%% Derived Quantities
+% Calculated automatically from Section 1.
+fprintf(' Experiment Parameters \n');
+%  Convergence geometry
+% The beam converges at half-angle = 2.7 degrees towards the focal spot.
+% tan(half_angle) = (source_radius) / (source_to_focal_mm)
+% We can verify the source radius is geometrically consistent:
+half_angle_rad        = half_angle_deg * pi / 180;  % Convert degrees to radians
+source_radius_from_angle = source_to_focal_mm * tan(half_angle_rad);
+%  This is the expected source radius implied by the convergence angle.
+%  It should be close to source_diameter_mm / 2 = 7.0 mm.
+%  Small differences are fine
+source_radius         = source_diameter_mm / 2; % Actual source radius used in code
+% Scan grid positions (hexagonal, clipped to the circular source face)
+aperture_radius_mm    = aperture_diameter_mm / 2;
+aperture_spacing_mm   = aperture_spacing_factor * aperture_diameter_mm;
+
+if require_full_aperture_inside_source
+% A position's farthest aperture edge is at (centre distance + aperture radius);
+% requiring that <= source_radius means centre distance <= source_radius - aperture radius.
+    point_inclusion_radius_mm = source_radius - aperture_radius_mm;
+if point_inclusion_radius_mm <= 0
+        error('require_full_aperture_inside_source leaves no room: aperture_diameter_mm too large for source_diameter_mm.');
+end
+else
+    point_inclusion_radius_mm = source_radius;
+end
+
+% Analytic cross-check: in an infinite hex lattice of pitch s, each point
+% owns a Voronoi cell of area (sqrt(3)/2)*s^2, so faceArea/cellArea is an
+% upper-bound point-count estimate (an upper bound because rim points lose
+% part of their cell to the face boundary):
+analytic_grid_estimate = (pi * point_inclusion_radius_mm^2) / ((sqrt(3)/2) * aperture_spacing_mm^2);
+% Build the finite hexagonal grid, keeping only points within point_inclusion_radius_mm:
+[raw_scan_x_mm, raw_scan_y_mm, raw_scan_row_idx] = generate_hex_grid_points(point_inclusion_radius_mm, aperture_spacing_mm);
+% Order the grid points into a scan path:
+switch lower(scan_pattern)
+case 'raster'
+        scan_order = raster_order_indices(raw_scan_x_mm, raw_scan_y_mm, raw_scan_row_idx);
+case 'spiral'
+        scan_order = spiral_order_indices(raw_scan_x_mm, raw_scan_y_mm);
+otherwise
+        error('scan_pattern must be ''raster'' or ''spiral''.');
+end
+scan_x_mm       = raw_scan_x_mm(scan_order);    % x-coordinates of all aperture positions, in scan order
+scan_y_mm       = raw_scan_y_mm(scan_order);    % y-coordinates of all aperture positions, in scan order
+scan_row_idx    = raw_scan_row_idx(scan_order); % which hex row each position belongs to
+total_positions = numel(scan_x_mm);
+% Resolve the requested example position to the nearest actual scan point:
+[~, example_point_index] = min(hypot(scan_x_mm - example_x_mm, scan_y_mm - example_y_mm));
+
+%  Magnification
+% The beam converges to the focal spot, then diverges onwards to the film.
+% The tungsten disc is placed at source_to_disc_mm from the source face,
+% which is BEFORE the focal spot (i.e. on the converging side).
+%
+% Distance from the disc to the focal spot (still on converging side):
+disc_to_focal_mm  = source_to_focal_mm - source_to_disc_mm;
+% Distance from the focal spot to the film (diverging side):
+focal_to_film_mm  = film_depth_mm - source_to_focal_mm;
+% Magnification of a feature at the disc when projected onto the film.
+% The focal spot acts like the apex of the X shape; features before it
+% are imaged onto the film with this magnification ratio:
+magnification     = focal_to_film_mm / disc_to_focal_mm;
+% The aperture's circular shadow on the film is magnified by this factor:
+aperture_at_film_mm = aperture_diameter_mm * magnification;
+% Full parameter summary
+fprintf('  Source diameter              : %.1f mm\n', source_diameter_mm);
+fprintf('  Source radius (actual)       : %.2f mm\n', source_radius);
+fprintf('  Source radius (from angle)   : %.2f mm  [geometry check]\n', source_radius_from_angle);
+fprintf('  Convergence half-angle       : %.1f degrees\n', half_angle_deg);
+fprintf('  Aperture diameter            : %.2f mm\n', aperture_diameter_mm);
+fprintf('  Source face to disc          : %.1f mm\n', source_to_disc_mm);
+fprintf('  Source face to focal spot    : %.0f mm\n', source_to_focal_mm);
+fprintf('  Disc to focal spot           : %.1f mm\n', disc_to_focal_mm);
+fprintf('  Focal spot to film           : %.1f mm\n', focal_to_film_mm);
+fprintf('  Source face to film          : %.0f mm\n', film_depth_mm);
+fprintf('  Beam magnification           : %.3f x\n', magnification);
+fprintf('  Aperture footprint on film   : %.3f mm\n', aperture_at_film_mm);
+fprintf('  Aperture pitch (hex grid)    : %.3f mm  (spacing factor %.2f)\n', aperture_spacing_mm, aperture_spacing_factor);
+fprintf('  Analytic point-count estimate: %.1f  (upper bound; edge effects reduce it)\n', analytic_grid_estimate);
+fprintf('  Scan grid                    : %d positions (hexagonal, %s order, %d rows)\n', ...
+        total_positions, scan_pattern, numel(unique(scan_row_idx)));
+fprintf('  [For reference, the old rectangular 28x28 grid gave 784 positions]\n');
+fprintf('\n');
+
+%% Synthetic Beam Profile (2D Gaussian)
+fprintf(' Generating Synthetic Beam Profile \n');
+% Fine grid over the source face (in mm, centred at 0,0):
+% (This same fine grid is reused below as the interpolation grid onto
+% which the sparse hexagonal scan data is resampled for display and
+%  for FWHM / contour analysis, so Figure 1 and the reconstructed-beam
+%  figures share identical axes.)
+resolution_source = 200;
+source_coords = linspace(-source_radius, source_radius, resolution_source);
+[src_X, src_Y] = meshgrid(source_coords, source_coords);
+% Circular mask; beam is zero outside the source boundary:
+source_mask = (src_X.^2 + src_Y.^2) <= source_radius^2;
+if use_gaussian_beam
+%  2D Gaussian Beam
+% sigma_beam controls the width of the bell curve.
+% A smaller sigma = narrower, more peaked beam.
+    sigma_beam = source_diameter_mm / 4;  % Width parameter (mm)
+    true_beam  = exp(-(src_X.^2 + src_Y.^2) / (2 * sigma_beam^2));
+    beam_model_name = sprintf('2D Gaussian (sigma = %.2f mm)', sigma_beam);
+
+%  Optional Alternative Beam Profiles
+elseif use_tophat_beam
+% Uniform Disc Beam
+% Constant intensity across the whole source circle, zero outside.
+% This would represent a perfectly uniform source with a hard edge.
+    true_beam = double(source_mask);  % 1.0 inside circle, 0.0 outside
+    beam_model_name = 'Top-Hat (uniform disc)';
+elseif use_asymmetric_beam
+% Assymmetric Gaussian Beam
+% The Gaussian peak is shifted away from the centre of the source.
+    offset_x   = source_radius * 0.3;  % Shift peak 30% of radius to the right
+    offset_y   = source_radius * 0.2;  % Shift peak 20% of radius upward
+    sigma_beam = source_diameter_mm / 5;
+    true_beam  = exp(-((src_X - offset_x).^2 + (src_Y - offset_y).^2) ...
+                     / (2 * sigma_beam^2));
+    beam_model_name = sprintf('Asymmetric Gaussian (offset = %.1f, %.1f mm)', ...
+                              offset_x, offset_y);
+else
+% Fallback: default Gaussian if no flag is set
+    sigma_beam = source_diameter_mm / 4;
+    true_beam  = exp(-(src_X.^2 + src_Y.^2) / (2 * sigma_beam^2));
+    beam_model_name = '2D Gaussian (fallback)';
+end
+% Apply the circular source boundary mask to whichever model was chosen:
+true_beam = true_beam .* source_mask;
+% Normalise so the peak is exactly 1.0:
+true_beam = true_beam / max(true_beam(:));
+fprintf('  Beam model: %s\n', beam_model_name);
+fprintf('  Source area masked to circular boundary\n\n');
+
+%% Simulate Film Exposures for Each Aperture Position
+%  For every position the tungsten disc is moved to, what the
+%  Gafchromic film would record is simulated.
+%
+%  Every film image is saved into a 3D array called all_film_images.
+%  Its dimensions are: [film_pixels x film_pixels x total_positions]
+%  So all_film_images(:,:,5) is the 5th film image, for example.
+%  Each image corresponds to one aperture position.
+%  The position number now follows the HEXAGONAL scan order computed
+%  above (row-by-row serpentine by default), not a rectangular
+%  column-then-row order:
+%    position 1  = scan_x_mm(1),  scan_y_mm(1)
+%    position 2  = scan_x_mm(2),  scan_y_mm(2)
+%    ...
+%    position N  = scan_x_mm(N),  scan_y_mm(N)   (N = total_positions)
+
+%  To retrieve any film image; all_film_images(:,:, pos_number)
+%  A lookup table is also stored: film_position_log.
+fprintf(' Simulating Film Exposures \n');
+
+% Pre-allocate the reconstructed beam values, one per scan position
+% (a 1D list now, not a 2D grid, since the hexagonal scan positions do
+% not sit on a rectangular ix/iy grid):
+reconstructed_beam  = zeros(total_positions, 1);
+% Pre-allocate the peak film signal, one per scan position:
+film_peak_intensity = zeros(total_positions, 1);
+% Optionally pre-allocate a 3D array to store ALL film images:
+if store_all_films
+    all_film_images = zeros(film_pixels, film_pixels, total_positions);
+% If run out of memory, set store_all_films = false in Section 1.
+end
+% A log table: one row per scan position, columns = [position_number, hex_row, x_mm, y_mm]
+film_position_log = zeros(total_positions, 4);
+% Coordinate grid for the film surface (mm, centred at 0,0):
+film_coords = linspace(-film_size_mm/2, film_size_mm/2, film_pixels);
+[film_X, film_Y] = meshgrid(film_coords, film_coords);
+example_film_image = [];   % Will hold the chosen example film image
+example_pos_label  = '';   % Label for Figure 2 title
+
+% Main scanning loop — single pass over the ordered hexagonal scan points:
+
+for pos_count = 1 : total_positions
+% Current aperture centre coordinates on the source face (mm):
+    ap_x = scan_x_mm(pos_count);
+    ap_y = scan_y_mm(pos_count);
+% Log this position:
+    film_position_log(pos_count, :) = [pos_count, scan_row_idx(pos_count), ap_x, ap_y];
+% Look up the true beam intensity at this aperture position:
+    [~, idx_x] = min(abs(source_coords - ap_x));
+    [~, idx_y] = min(abs(source_coords - ap_y));
+    intensity_at_aperture = true_beam(idx_y, idx_x);
+
+% Store this intensity value in the reconstructed beam list:
+    reconstructed_beam(pos_count) = intensity_at_aperture;
+% Where does the aperture's beam land on the film?
+% The photons pass through the aperture at (ap_x, ap_y) on the disc,
+% converge to the focal spot (which acts like a lens), then diverge.
+% The magnification scales up the position on the film:
+    spot_x_film = ap_x * magnification;
+    spot_y_film = ap_y * magnification;
+% Creating the film image:
+    spot_sigma  = aperture_at_film_mm / 3;
+    film_image  = intensity_at_aperture * ...
+                  exp(-((film_X - spot_x_film).^2 + (film_Y - spot_y_film).^2) ...
+                      / (2 * spot_sigma^2));
+% Addition of random noise to simulate film grain:
+    film_image  = film_image + noise_level * rand(film_pixels, film_pixels);
+% Record the peak (brightest pixel) on this film image.
+% This is the "Peak Film Signal" — one number per exposure:
+    film_peak_intensity(pos_count) = max(film_image(:));
+% Store the full film image if requested:
+if store_all_films
+        all_film_images(:, :, pos_count) = film_image;
+end
+% Save the chosen example image for Figure 2:
+if pos_count == example_point_index
+        example_film_image = film_image;
+        example_pos_label  = sprintf('Aperture position: x = %.2f mm, y = %.2f mm', ...
+                                      ap_x, ap_y);
+end
+end  % end scan loop
+fprintf('  Completed %d film exposures\n', total_positions);
+if store_all_films
+    fprintf('  All film images stored in: all_film_images(:,:,1:%d)\n', total_positions);
+    fprintf('  To view image for position N: imagesc(all_film_images(:,:,N))\n');
+end
+fprintf('  Position log stored in: film_position_log  [pos, hex_row, x_mm, y_mm]\n\n');
+
+%% Beam Analysis
+%  Extract the standard metrics from the reconstructed beam map.
+%
+%  The hexagonal scan positions are not on a rectangular grid, so before
+%  the usual grid-based metrics (FWHM, contour, peak position) can be
+%  computed the sparse scan values are resampled onto the SAME fine
+%  regular grid used for the true beam (source_coords) with griddata.
+%  Positions outside the region the aperture could actually reach
+%  (radius > point_inclusion_radius_mm) are left as NaN — there is no
+%  data there, so nothing is invented for them.
+fprintf(' Beam Analysis \n');
+reconstructed_beam_grid = griddata(scan_x_mm, scan_y_mm, reconstructed_beam, src_X, src_Y, 'linear');
+data_reach_mask = (src_X.^2 + src_Y.^2) <= point_inclusion_radius_mm^2;
+reconstructed_beam_grid(~data_reach_mask) = NaN;
+% Normalise the reconstructed beam map so the peak = 1.0:
+reconstructed_beam_peak = max(reconstructed_beam_grid(:));  % max() ignores NaN by default
+reconstructed_beam_norm = reconstructed_beam_grid / reconstructed_beam_peak;
+% Same normalisation applied to the raw (unsampled) scan values, used
+% below for the radial profile and encircled energy, which are computed
+% directly from the actual scan points rather than the interpolated grid:
+reconstructed_beam_scan_norm = reconstructed_beam / reconstructed_beam_peak;
+%  Peak position
+[peak_val, peak_lin_idx] = max(reconstructed_beam_norm(:));
+[peak_row, peak_col]     = ind2sub(size(reconstructed_beam_norm), peak_lin_idx);
+peak_x_mm = source_coords(peak_col);
+peak_y_mm = source_coords(peak_row);
+fprintf('  Peak intensity           : %.4f (normalised)\n', peak_val);
+fprintf('  Peak position x          : %.3f mm from source centre\n', peak_x_mm);
+fprintf('  Peak position y          : %.3f mm from source centre\n', peak_y_mm);
+
+% FWHM (Full Width at Half Maximum)
+% This is the standard beam width measurement: the width at 50% intensity.
+% Slices are taken through the interpolated grid (not the raw scan
+% points, which do not lie on a clean row/column through the peak).
+h_slice    = reconstructed_beam_norm(peak_row, :);
+v_slice    = reconstructed_beam_norm(:, peak_col);
+half_max   = 0.5;
+idx_h = find(h_slice >= half_max);
+idx_v = find(v_slice >= half_max);
+if numel(idx_h) >= 2
+    fwhm_x_mm = source_coords(idx_h(end)) - source_coords(idx_h(1));
+else
+    fwhm_x_mm = NaN;
+end
+if numel(idx_v) >= 2
+    fwhm_y_mm = source_coords(idx_v(end)) - source_coords(idx_v(1));
+else
+    fwhm_y_mm = NaN;
+end
+fprintf('  Beam FWHM (x)            : %.3f mm\n', fwhm_x_mm);
+fprintf('  Beam FWHM (y)            : %.3f mm\n', fwhm_y_mm);
+%  Circularity
+if ~isnan(fwhm_x_mm) && ~isnan(fwhm_y_mm)
+    circularity = 1 - abs(fwhm_x_mm - fwhm_y_mm) / max(fwhm_x_mm, fwhm_y_mm);
+    fprintf('  Beam circularity         : %.4f  (1.0 = perfect circle)\n', circularity);
+end
+
+%  Total integrated signal (sum over the actual scan points, which is
+%  the physically meaningful quantity — summing the interpolated grid
+%  would double-count information that was never actually measured):
+total_integrated = sum(reconstructed_beam_scan_norm(:));
+fprintf('  Total integrated signal  : %.3f  (sum over %d actual scan points)\n\n', total_integrated, total_positions);
+
+%% Optional Extra Analyses
+%  Each block below is controlled by a true/false flag in Section 1.
+% Optional 1: Radial Intensity Profile
+% Instead of looking at horizontal/vertical slices, how intensity
+%  varies as a function of radial distance from the beam centre can be computed.
+%  This helps in confirming whether the beam is circular or not.
+%  Computed directly from the actual (hexagonal) scan points, not the
+%  interpolated grid, so this reflects exactly what was measured.
+if run_radial_profile
+    fprintf('--- Optional Analysis 1: Radial Profile ---\n');
+% Radial distance of each ACTUAL scan position from the beam peak:
+    radial_dist = sqrt((scan_x_mm - peak_x_mm).^2 + (scan_y_mm - peak_y_mm).^2);
+% Flatten into vectors for easy plotting:
+    r_vec = radial_dist(:);
+    i_vec = reconstructed_beam_scan_norm(:);
+% Sort by radius so the plot goes left-to-right:
+    [r_sorted, sort_idx] = sort(r_vec);
+    i_sorted = i_vec(sort_idx);
+    fprintf('  Radial profile computed (%d data points)\n\n', numel(r_sorted));
+end
+% Optional 2: Encircled Energy
+%  Encircled energy answers: "What fraction of the total beam intensity is
+%  contained within a circle of radius r?"
+%  This could help in dosimetry and for understanding how focused the
+%  beam is. Computed directly from the actual scan points.
+if run_encircled_energy
+    fprintf('--- Optional Analysis 2: Encircled Energy ---\n');
+    radial_dist2 = sqrt((scan_x_mm - peak_x_mm).^2 + (scan_y_mm - peak_y_mm).^2);
+% Define a range of radii from 0 to the maximum scan radius:
+    max_radius_mm  = max(radial_dist2(:));
+    radius_steps   = linspace(0, max_radius_mm, 100);
+    encircled_frac = zeros(size(radius_steps));
+    total_signal   = sum(reconstructed_beam_scan_norm(:));
+for k = 1 : numel(radius_steps)
+        inside_circle        = radial_dist2 <= radius_steps(k);
+        encircled_frac(k)    = sum(reconstructed_beam_scan_norm(inside_circle)) / total_signal;
+end
+% Find the radius that contains 50%, 80%, and 95% of total energy:
+    r_50 = radius_steps(find(encircled_frac >= 0.50, 1, 'first'));
+    r_80 = radius_steps(find(encircled_frac >= 0.80, 1, 'first'));
+    r_95 = radius_steps(find(encircled_frac >= 0.95, 1, 'first'));
+    fprintf('  Radius containing 50%% of total energy: %.3f mm\n', r_50);
+    fprintf('  Radius containing 80%% of total energy: %.3f mm\n', r_80);
+    fprintf('  Radius containing 95%% of total energy: %.3f mm\n\n', r_95);
+end
+
+% Optional 3: Gaussian Curve Fit
+%  Fit a mathematical Gaussian to the horizontal and vertical beam profiles.
+%  This gives more precise FWHM values than just reading off grid points,
+%  and also tells the fitted centre position and peak value.
+%  Output: fitted_sigma_x, fitted_sigma_y, fitted_fwhm_x, fitted_fwhm_y
+%
+%  The Gaussian model used is: I(x) = A * exp(-(x - mu)^2 / (2*sigma^2))
+%    A     = peak height
+%    mu    = centre position
+%    sigma = width (FWHM = 2 * sqrt(2 * ln(2)) * sigma ≈ 2.355 * sigma)
+%
+%  Fitted on the interpolated grid slices (source_coords), with any NaN
+%  points outside the data-reach circle removed first.
+if run_gaussian_fit
+    fprintf('--- Optional Analysis 3: Gaussian Curve Fit ---\n');
+% Fit to horizontal profile:
+    gauss_model = @(p, x) p(1) * exp(-(x - p(2)).^2 / (2 * p(3)^2));
+% p(1) = amplitude, p(2) = centre, p(3) = sigma
+    mask_h = ~isnan(h_slice);
+    mask_v = ~isnan(v_slice);
+% Initial guesses for the fit parameters:
+    p0_h = [1.0, peak_x_mm, fwhm_x_mm / 2.355];
+try
+        p_fit_h    = lsqcurvefit(gauss_model, p0_h, source_coords(mask_h), h_slice(mask_h), [], [], ...
+                                  optimset('Display','off'));
+        fitted_sigma_x = abs(p_fit_h(3));
+        fitted_fwhm_x  = 2.355 * fitted_sigma_x;
+        fitted_centre_x = p_fit_h(2);
+        fprintf('  Fitted centre (x)        : %.3f mm\n', fitted_centre_x);
+        fprintf('  Fitted sigma (x)         : %.3f mm\n', fitted_sigma_x);
+        fprintf('  Fitted FWHM (x)          : %.3f mm\n', fitted_fwhm_x);
+% Store fitted curve for plotting:
+        x_fine      = linspace(min(source_coords), max(source_coords), 300);
+        h_fit_curve = gauss_model(p_fit_h, x_fine);
+catch
+        fprintf('  WARNING: Horizontal Gaussian fit failed. lsqcurvefit may not\n');
+        fprintf('           be available. Skipping fitted curve.\n');
+        run_gaussian_fit = false;
+end
+
+% Fit to vertical profile:
+if run_gaussian_fit
+        p0_v = [1.0, peak_y_mm, fwhm_y_mm / 2.355];
+try
+            p_fit_v    = lsqcurvefit(gauss_model, p0_v, source_coords(mask_v), v_slice(mask_v), [], [], ...
+                                      optimset('Display','off'));
+            fitted_sigma_y = abs(p_fit_v(3));
+            fitted_fwhm_y  = 2.355 * fitted_sigma_y;
+            fitted_centre_y = p_fit_v(2);
+            fprintf('  Fitted centre (y)        : %.3f mm\n', fitted_centre_y);
+            fprintf('  Fitted sigma (y)         : %.3f mm\n', fitted_sigma_y);
+            fprintf('  Fitted FWHM (y)          : %.3f mm\n\n', fitted_fwhm_y);
+            y_fine      = linspace(min(source_coords), max(source_coords), 300);
+            v_fit_curve = gauss_model(p_fit_v, y_fine);
+catch
+            run_gaussian_fit = false;
+end
+end
+end
+
+% Optional 4: Contour Plot Data
+%  A contour plot shows lines of equal beam intensity, like a topographic
+%  map. It gives a clear visual of the beam shape and symmetry.
+%  Contour levels are set at 10%, 20%, ... 90% of peak intensity.
+if run_contour_plot
+    contour_levels = 0.1 : 0.1 : 0.9;  % 9 contour lines at 10% intervals
+% (Used in the plotting section below, on the interpolated grid.)
+end
+%% SECTION 6: FIGURES
+%  All plots are created here.
+fprintf(' Creating Figures \n');
+% Colour scheme:
+bg_color     = [0.08, 0.08, 0.12];
+text_color   = [0.95, 0.95, 0.95];
+accent_color = [0.20, 0.75, 0.90];
+theta        = linspace(0, 2*pi, 200);  % For drawing circles
+% FIGURE 1: True (synthetic) beam profile
+fig1 = figure('Color', bg_color, 'Position', [30, 30, 600, 500]);
+imagesc(source_coords, source_coords, true_beam);
+axis equal tight; colormap(hot);
+cb = colorbar; cb.Color = text_color;
+cb.Label.String = 'Relative Intensity (normalised)'; cb.Label.Color = text_color;
+xlabel('Source Face — X (mm)', 'Color', text_color, 'FontSize', 11);
+ylabel('Source Face — Y (mm)', 'Color', text_color, 'FontSize', 11);
+title({'FIGURE 1: True Synthetic Beam Profile', ...
+       sprintf('Model: %s', beam_model_name)}, ...
+'Color', accent_color, 'FontSize', 12, 'FontWeight', 'bold');
+set(gca, 'Color', bg_color, 'XColor', text_color, 'YColor', text_color);
+hold on;
+plot(source_radius*cos(theta), source_radius*sin(theta), '--', ...
+'Color', accent_color, 'LineWidth', 1.5);
+legend({'Source boundary'}, 'TextColor', text_color, ...
+'Color', bg_color, 'EdgeColor', [0.4 0.4 0.4]);
+grid on; hold off;
+fprintf('  Figure 1: True beam profile\n');
+% FIGURE 2: Example film image
+%  Showing the film for the scan point nearest (example_x_mm, example_y_mm)
+%  set in Section 1.
+%
+fig2 = figure('Color', bg_color, 'Position', [80, 80, 600, 500]);
+imagesc(film_coords, film_coords, example_film_image);
+axis equal tight; colormap(hot);
+cb2 = colorbar; cb2.Color = text_color;
+cb2.Label.String = 'Film Response (a.u.)'; cb2.Label.Color = text_color;
+xlabel('Film — X (mm)', 'Color', text_color, 'FontSize', 11);
+ylabel('Film — Y (mm)', 'Color', text_color, 'FontSize', 11);
+title({'FIGURE 2: Example Film Image (Single Exposure)', ...
+       example_pos_label, ...
+       sprintf('(Scan point #%d of %d)', example_point_index, total_positions)}, ...
+'Color', accent_color, 'FontSize', 11, 'FontWeight', 'bold');
+set(gca, 'Color', bg_color, 'XColor', text_color, 'YColor', text_color);
+hold on;
+film_half = film_size_mm / 2;
+rectangle('Position', [-film_half, -film_half, film_size_mm, film_size_mm], ...
+'EdgeColor', accent_color, 'LineStyle', '--', 'LineWidth', 1.5);
+grid on; hold off;
+fprintf('  Figure 2: Example film exposure (scan point #%d)\n', example_point_index);
+
+% FIGURE 3: Reconstructed beam map
+%  Shown as a smooth interpolated map (griddata onto source_coords) so
+%  it is visually comparable to Figure 1, with the actual hexagonal scan
+%  points overlaid as dots so the real (sparse) sampling is not hidden.
+fig3 = figure('Color', bg_color, 'Position', [130, 130, 600, 500]);
+imagesc(source_coords, source_coords, reconstructed_beam_norm);
+axis equal tight; colormap(hot);
+set(gca, 'YDir', 'normal');
+cb3 = colorbar; cb3.Color = text_color;
+cb3.Label.String = 'Relative Intensity (normalised)'; cb3.Label.Color = text_color;
+xlabel('Aperture Position — X (mm)', 'Color', text_color, 'FontSize', 11);
+ylabel('Aperture Position — Y (mm)', 'Color', text_color, 'FontSize', 11);
+title({'FIGURE 3: Reconstructed Beam Map', ...
+       sprintf('%d positions (hexagonal, %s order) | aperture = %.2f mm | disc at %.0f mm from source', ...
+               total_positions, scan_pattern, aperture_diameter_mm, source_to_disc_mm)}, ...
+'Color', accent_color, 'FontSize', 11, 'FontWeight', 'bold');
+set(gca, 'Color', bg_color, 'XColor', text_color, 'YColor', text_color);
+hold on;
+plot(scan_x_mm, scan_y_mm, '.', 'Color', [1 1 1], 'MarkerSize', 3);
+plot(peak_x_mm, peak_y_mm, '+', 'Color', [1 1 0], 'MarkerSize', 14, 'LineWidth', 2);
+plot(source_radius*cos(theta), source_radius*sin(theta), '--', ...
+'Color', accent_color, 'LineWidth', 1.2);
+legend({'Scan points', 'Peak', 'Source boundary'}, 'TextColor', text_color, ...
+'Color', bg_color, 'EdgeColor', [0.4 0.4 0.4]);
+grid on; hold off;
+fprintf('  Figure 3: Reconstructed beam map\n');
+% FIGURE 4: Beam profiles (H and V slices)
+fig4 = figure('Color', bg_color, 'Position', [180, 180, 860, 450]);
+subplot(1, 2, 1); set(gca, 'Color', bg_color);
+plot(source_coords, h_slice, '-', 'Color', accent_color, 'LineWidth', 1.8);
+hold on;
+yline(0.5, '--', 'Color', [1 0.7 0], 'LineWidth', 1.4);
+if run_gaussian_fit && exist('h_fit_curve','var')
+    plot(x_fine, h_fit_curve, '-', 'Color', [1 0.4 0.4], 'LineWidth', 1.6);
+    legend({'Data (interpolated)', '50% level', 'Gaussian fit'}, 'TextColor', text_color, ...
+'Color', bg_color, 'EdgeColor', [0.4 0.4 0.4]);
+else
+    legend({'Data (interpolated)', '50% level'}, 'TextColor', text_color, ...
+'Color', bg_color, 'EdgeColor', [0.4 0.4 0.4]);
+end
+xlabel('X (mm)', 'Color', text_color, 'FontSize', 11);
+ylabel('Relative Intensity', 'Color', text_color, 'FontSize', 11);
+title({'Horizontal Profile', sprintf('FWHM = %.3f mm', fwhm_x_mm)}, ...
+'Color', accent_color, 'FontSize', 11, 'FontWeight', 'bold');
+set(gca, 'Color', bg_color, 'XColor', text_color, 'YColor', text_color);
+grid on; ylim([0 1.15]); hold off;
+subplot(1, 2, 2); set(gca, 'Color', bg_color);
+plot(source_coords, v_slice, '-', 'Color', [0.90, 0.50, 0.20], 'LineWidth', 1.8);
+hold on;
+yline(0.5, '--', 'Color', [1 0.7 0], 'LineWidth', 1.4);
+if run_gaussian_fit && exist('v_fit_curve','var')
+    plot(y_fine, v_fit_curve, '-', 'Color', [1 0.4 0.4], 'LineWidth', 1.6);
+    legend({'Data (interpolated)', '50% level', 'Gaussian fit'}, 'TextColor', text_color, ...
+'Color', bg_color, 'EdgeColor', [0.4 0.4 0.4]);
+else
+    legend({'Data (interpolated)', '50% level'}, 'TextColor', text_color, ...
+'Color', bg_color, 'EdgeColor', [0.4 0.4 0.4]);
+end
+xlabel('Y (mm)', 'Color', text_color, 'FontSize', 11);
+ylabel('Relative Intensity', 'Color', text_color, 'FontSize', 11);
+title({'Vertical Profile', sprintf('FWHM = %.3f mm', fwhm_y_mm)}, ...
+'Color', [0.90, 0.50, 0.20], 'FontSize', 11, 'FontWeight', 'bold');
+set(gca, 'Color', bg_color, 'XColor', text_color, 'YColor', text_color);
+grid on; ylim([0 1.15]); hold off;
+sgtitle('FIGURE 4: Beam Profiles Through Peak (interpolated from hexagonal scan)', 'Color', accent_color, ...
+'FontSize', 13, 'FontWeight', 'bold');
+fprintf('  Figure 4: Beam profiles (H and V)\n');
+% FIGURE 5: Three-panel comparison
+fig5 = figure('Color', bg_color, 'Position', [230, 230, 1150, 450]);
+subplot(1, 3, 1); set(gca, 'Color', bg_color);
+imagesc(source_coords, source_coords, true_beam);
+axis equal tight; colormap(hot);
+title('True Beam (ground truth)', 'Color', accent_color, 'FontSize', 11);
+xlabel('X (mm)', 'Color', text_color); ylabel('Y (mm)', 'Color', text_color);
+set(gca, 'XColor', text_color, 'YColor', text_color);
+colorbar('Color', text_color);
+subplot(1, 3, 2); set(gca, 'Color', bg_color);
+imagesc(source_coords, source_coords, reconstructed_beam_norm);
+axis equal tight; colormap(hot);
+set(gca, 'YDir', 'normal');
+title('Reconstructed Beam (from hexagonal scan)', 'Color', accent_color, 'FontSize', 11);
+xlabel('Aperture X (mm)', 'Color', text_color); ylabel('Aperture Y (mm)', 'Color', text_color);
+set(gca, 'XColor', text_color, 'YColor', text_color);
+colorbar('Color', text_color);
+subplot(1, 3, 3); set(gca, 'Color', bg_color);
+%
+% imagesc(scan_x_mm, scan_y_mm, film_peak_intensity / max(film_peak_intensity(:)));
+% axis equal tight; colormap(hot);
+% title({'Peak Film Signal per Position', ...
+%        '(Max pixel value on each film exposure)'}, ...
+%        'Color', accent_color, 'FontSize', 11);
+% xlabel('Aperture X (mm)', 'Color', text_color); ylabel('Aperture Y (mm)', 'Color', text_color);
+% set(gca, 'XColor', text_color, 'YColor', text_color);
+% colorbar('Color', text_color);
+% sgtitle('FIGURE 5: True vs Reconstructed vs Film Peak Signal', ...
+%         'Color', accent_color, 'FontSize', 13, 'FontWeight', 'bold');
+% fprintf('  Figure 5: Comparison (true / reconstructed / peak film signal)\n');
+
+% FIGURE 6: Optional extra analysis plots
+n_optional_plots = run_radial_profile + run_encircled_energy + run_contour_plot;
+if n_optional_plots > 0
+    fig6 = figure('Color', bg_color, 'Position', [280, 280, 380*n_optional_plots, 450]);
+    subplot_idx = 0;
+if run_radial_profile
+        subplot_idx = subplot_idx + 1;
+        subplot(1, n_optional_plots, subplot_idx);
+        set(gca, 'Color', bg_color);
+        scatter(r_sorted, i_sorted, 12, accent_color, 'filled', 'MarkerFaceAlpha', 0.5);
+        xlabel('Radial Distance from Peak (mm)', 'Color', text_color, 'FontSize', 11);
+        ylabel('Relative Intensity', 'Color', text_color, 'FontSize', 11);
+        title({'Radial Intensity Profile', '(All scan positions)'}, ...
+'Color', accent_color, 'FontSize', 11, 'FontWeight', 'bold');
+        set(gca, 'XColor', text_color, 'YColor', text_color);
+        grid on; ylim([0 1.1]);
+end
+if run_encircled_energy
+        subplot_idx = subplot_idx + 1;
+        subplot(1, n_optional_plots, subplot_idx);
+        set(gca, 'Color', bg_color);
+        plot(radius_steps, encircled_frac * 100, '-', 'Color', accent_color, 'LineWidth', 2);
+        hold on;
+        yline(50, '--', 'Color', [1 0.8 0], 'LineWidth', 1.2);
+        yline(80, '--', 'Color', [1 0.5 0], 'LineWidth', 1.2);
+        yline(95, '--', 'Color', [1 0.2 0], 'LineWidth', 1.2);
+        xlabel('Radius (mm)', 'Color', text_color, 'FontSize', 11);
+        ylabel('Encircled Energy (%)', 'Color', text_color, 'FontSize', 11);
+        title({'Encircled Energy', sprintf('50%%=%.2fmm  80%%=%.2fmm  95%%=%.2fmm', ...
+               r_50, r_80, r_95)}, 'Color', accent_color, 'FontSize', 11, 'FontWeight', 'bold');
+        set(gca, 'XColor', text_color, 'YColor', text_color);
+        legend({'Encircled %', '50%','80%','95%'}, 'TextColor', text_color, ...
+'Color', bg_color, 'EdgeColor', [0.4 0.4 0.4]);
+        grid on; ylim([0 105]); hold off;
+end
+if run_contour_plot
+        subplot_idx = subplot_idx + 1;
+        subplot(1, n_optional_plots, subplot_idx);
+        set(gca, 'Color', bg_color);
+        contourf(source_coords, source_coords, reconstructed_beam_norm, contour_levels);
+        colormap(hot); colorbar('Color', text_color);
+        hold on;
+        plot(source_radius*cos(theta), source_radius*sin(theta), '--', ...
+'Color', accent_color, 'LineWidth', 1.5);
+        plot(peak_x_mm, peak_y_mm, '+', 'Color', [1 1 0], 'MarkerSize', 14, 'LineWidth', 2);
+        xlabel('X (mm)', 'Color', text_color, 'FontSize', 11);
+        ylabel('Y (mm)', 'Color', text_color, 'FontSize', 11);
+        title({'Intensity Contour Map', '(10% to 90% of peak, every 10%)'}, ...
+'Color', accent_color, 'FontSize', 11, 'FontWeight', 'bold');
+        set(gca, 'XColor', text_color, 'YColor', text_color);
+        axis equal; grid on; hold off;
+end
+    sgtitle('FIGURE 6: Optional Extra Analyses', 'Color', accent_color, ...
+'FontSize', 13, 'FontWeight', 'bold');
+    fprintf('  Figure 6: Optional analyses\n');
+end
+fprintf('\n');
+
+%% RESULTS SUMMARY
+fprintf('  RESULTS SUMMARY\n');
+fprintf('  Beam model used               : %s\n', beam_model_name);
+fprintf('  Aperture diameter             : %.2f mm\n', aperture_diameter_mm);
+fprintf('  Source face to disc           : %.1f mm\n', source_to_disc_mm);
+fprintf('  Convergence half-angle        : %.1f deg\n', half_angle_deg);
+fprintf('  Film distance from source     : %.0f mm\n', film_depth_mm);
+fprintf('  Beam magnification            : %.3f x\n', magnification);
+fprintf('  Aperture footprint on film    : %.3f mm\n', aperture_at_film_mm);
+fprintf('  Scan pattern                  : hexagonal grid, %s order\n', scan_pattern);
+fprintf('  Number of scan positions      : %d\n', total_positions);
+fprintf('  Peak beam position (x, y)     : (%.3f, %.3f) mm\n', peak_x_mm, peak_y_mm);
+fprintf('  Beam FWHM x                   : %.3f mm\n', fwhm_x_mm);
+fprintf('  Beam FWHM y                   : %.3f mm\n', fwhm_y_mm);
+if ~isnan(fwhm_x_mm) && ~isnan(fwhm_y_mm)
+    fprintf('  Beam circularity              : %.4f\n', circularity);
+end
+if run_encircled_energy
+    fprintf('  Radius at 50%% encircled energy: %.3f mm\n', r_50);
+    fprintf('  Radius at 80%% encircled energy: %.3f mm\n', r_80);
+    fprintf('  Radius at 95%% encircled energy: %.3f mm\n', r_95);
+end
+if run_gaussian_fit && exist('fitted_fwhm_x','var')
+    fprintf('  Fitted FWHM x (Gaussian fit)  : %.3f mm\n', fitted_fwhm_x);
+    fprintf('  Fitted FWHM y (Gaussian fit)  : %.3f mm\n', fitted_fwhm_y);
+end
+fprintf('==============================================\n\n');
+
+%% SAVE FIGURES
+if save_figures
+if ~exist(output_folder, 'dir'); mkdir(output_folder); end
+    saveas(fig1, fullfile(output_folder, 'fig1_true_beam.png'));
+    saveas(fig2, fullfile(output_folder, 'fig2_example_film.png'));
+    saveas(fig3, fullfile(output_folder, 'fig3_reconstructed_beam.png'));
+    saveas(fig4, fullfile(output_folder, 'fig4_beam_profiles.png'));
+    saveas(fig5, fullfile(output_folder, 'fig5_comparison.png'));
+if n_optional_plots > 0
+        saveas(fig6, fullfile(output_folder, 'fig6_optional_analyses.png'));
+end
+    fprintf('Figures saved to folder: %s\n\n', output_folder);
+end
+fprintf('Script complete.\n\n');
+
+%% SECTION 9: REAL DATA LOADING
+% When the real experiment has been carried out:
+%    1. Sections 3, 3B, and 4 above (the synthetic data parts) will be commented out.
+%    2. The image files are named and placed as described below.
+%    4. The analysis (Sections 5 onwards) then runs on the real data.
+%
+%  Assumptions:
+%  - The films are saved TIFF image files
+%  - The files are named sequentially: film_001.tif, film_002.tif, etc.,
+%    in the SAME hexagonal scan order as scan_x_mm/scan_y_mm above (i.e.
+%    film_NNN.tif is the exposure taken at aperture position
+%    (scan_x_mm(NNN), scan_y_mm(NNN))).
+%  - They are all stored in one folder (the image_folder is set below).
+%  What the code extracts from each image:
+%  The main measurement from each film is the PEAK optical density
+%  (the brightest point on the film after the exposure). For Gafchromic
+%  film, higher optical density = more dose = more photons landed there.
+% Real Data Loading
+%
+% Folder containing scanned film image files:
+% image_folder = 'C:\MyExperiment\FilmScans';
+%
+% File naming pattern.
+%
+% file_prefix  = 'film_';       % The text before the number in each filename
+% file_suffix  = '.tif';        % The file extension (could also be '.tiff', '.png')
+%
+% fprintf(' Loading Real Film Images  \n');
+% fprintf('  Looking in folder: %s\n', image_folder);
+%
+% % Pre-allocate the same arrays as in the synthetic section:
+% reconstructed_beam  = zeros(total_positions, 1);
+% film_peak_intensity = zeros(total_positions, 1);
+% if store_all_films
+%     all_film_images = zeros(film_pixels, film_pixels, total_positions);
+% end
+% film_position_log   = zeros(total_positions, 4);
+%
+% for pos_count = 1 : total_positions
+%
+%         %  Build the filename for this position
+%         % e.g. position 7 → 'film_007.tif'
+%         filename = sprintf('%s%03d%s', file_prefix, pos_count, file_suffix);
+%         full_path = fullfile(image_folder, filename);
+%
+%         %  Check the file exists before trying to load it
+%         if ~isfile(full_path)
+%             fprintf('  WARNING: File not found: %s — skipping.\n', full_path);
+%             continue;  % Skip this position and move on
+%         end
+%
+%         %  Load the image
+%         % imread reads the image as a matrix of pixel values.
+%         % double() converts integer pixel values to decimal numbers.
+%         raw_image = double(imread(full_path));
+%
+%         %  If the image has multiple colour channels, convert to greyscale
+%         % A greyscale image has size [rows x cols].
+%         % A colour image has size [rows x cols x 3].
+%
+%
+%         % Resize the image to match film_pixels x film_pixels if needed ---
+%         % This step is only needed if scanned images have a different
+%         % resolution to film_pixels. It rescales the image.
+%         if size(raw_image, 1) ~= film_pixels || size(raw_image, 2) ~= film_pixels
+%             raw_image = imresize(raw_image, [film_pixels, film_pixels]);
+%         end
+%
+%         % Normalise: scale pixel values to range 0.0 to 1.0
+%         % Divide by the maximum possible pixel value for the image bit depth.
+%         % Most scanners produce 8-bit (max = 255) or 16-bit (max = 65535) images.
+%         % The scanner's documentation is to be checked to confirm which it is.
+%         bit_depth = 16;  % Change to 8 if scanner produces 8-bit images
+%         film_image = raw_image / (2^bit_depth - 1);
+%
+%         % Use the integrated (total) signal
+%         % peak_value = sum(film_image(:));
+%         % Alternatively, we extract the peak value from this film image
+%         % This is the single number to be used to represent the beam intensity
+%         % at this aperture position:
+%         peak_value = max(film_image(:));
+%
+%
+%
+%         %  Store results
+%         reconstructed_beam(pos_count)  = peak_value;
+%         film_peak_intensity(pos_count) = peak_value;
+%         film_position_log(pos_count, :) = [pos_count, scan_row_idx(pos_count), scan_x_mm(pos_count), scan_y_mm(pos_count)];
+%
+%         if store_all_films
+%             all_film_images(:, :, pos_count) = film_image;
+%         end
+%
+%         % Save the chosen example image for Figure 2
+%         if pos_count == example_point_index
+%             example_film_image = film_image;
+%             example_pos_label  = sprintf('Aperture: x = %.2f mm, y = %.2f mm  [REAL DATA]', ...
+%                                           scan_x_mm(pos_count), scan_y_mm(pos_count));
+%         end
+%
+%         % --- Print progress every 25 positions ---
+%         if mod(pos_count, 25) == 0 || pos_count == total_positions
+%             fprintf('  Loaded %d / %d images\n', pos_count, total_positions);
+%         end
+%
+% end  % end scan loop
+%
+% fprintf('  All real film images loaded.\n');
+% fprintf('  Reconstructed beam map ready for analysis.\n\n');
+%
+
+% % --- REAL DATA LOADING (uncomment to here) ---
+%% =======================================================================
+%  LOCAL FUNCTIONS (must follow all script code; still callable from above)
+%  Carried over from XRAY_PINHOLE_STAGE_SCAN_PLANNER.m, which established
+%  this hexagonal-grid + raster-order scan pattern as the correct one.
+%  =======================================================================
+function [x, y, rowIdx] = generate_hex_grid_points(boundary_radius_mm, spacing_mm)
+% Hexagonal (honeycomb) grid: alternate rows offset by spacing/2, row
+% height spacing*sqrt(3)/2 -- the standard hex close-packed construction.
+% Keeps candidate points whose centre lies within boundary_radius_mm.
+    row_height = spacing_mm * sqrt(3) / 2;
+    n_rows_half = ceil(boundary_radius_mm / row_height) + 1;
+    x = zeros(0, 1); y = zeros(0, 1); rowIdx = zeros(0, 1);
+for r = -n_rows_half:n_rows_half
+        yv = r * row_height;
+if abs(yv) > boundary_radius_mm, continue; end
+        x_offset = mod(abs(r), 2) * (spacing_mm / 2);
+        n_cols_half = ceil(boundary_radius_mm / spacing_mm) + 2;
+for c = -n_cols_half:n_cols_half
+            xv = c * spacing_mm + x_offset;
+if xv^2 + yv^2 <= boundary_radius_mm^2
+                x(end+1, 1) = xv; y(end+1, 1) = yv; rowIdx(end+1, 1) = r; %#ok<AGROW>
+end
+end
+end
+end
+function order = raster_order_indices(x, y, row_idx)
+% Row by row using the hex-grid row index, alternating sweep direction
+% each row (serpentine/boustrophedon) to minimise aperture travel.
+    unique_rows = sort(unique(row_idx));
+    order = zeros(0, 1);
+    going_right = true;
+for k = 1:numel(unique_rows)
+        idx_in_row = find(row_idx == unique_rows(k));
+        [~, sort_idx] = sort(x(idx_in_row));
+if ~going_right, sort_idx = flipud(sort_idx(:)); end
+        order = [order; idx_in_row(sort_idx)]; %#ok<AGROW>
+        going_right = ~going_right;
+end
+end
+function order = spiral_order_indices(x, y)
+% Sort by increasing radius then angle -> approximate centre-outward
+% spiral (radial+angular sort, not a strict hex-ring spiral, but simple
+% and gives the desired centre-out behaviour).
+    radius = sqrt(x.^2 + y.^2);
+    theta = atan2(y, x);
+    theta(theta < 0) = theta(theta < 0) + 2*pi;
+    [~, order] = sortrows([radius, theta]);
+end
+ 
